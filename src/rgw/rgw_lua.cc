@@ -84,31 +84,87 @@ bool verify(const std::string& script, std::string& err_msg)
   return true;
 }
 
-std::string script_oid(context ctx, const std::string& tenant) {
+// Parses a script oid key into its context, tenant, and name
+void parse_script_oid(const std::string& key, context& context, std::string& tenant, std::string& name) {
+  std::string prefix;
+  size_t p1 = key.find('.');
+  size_t p2 = (p1 != std::string::npos) ? key.find('.', p1 + 1) : std::string::npos;
+  size_t pos = (p2 != std::string::npos) ? key.find('.', p2 + 1) : std::string::npos;
+
+  // parse name and prefix
+  if (pos == std::string::npos) {
+    prefix = key;
+    name = "";
+  } else {
+    prefix = key.substr(0, pos);
+    name = key.substr(pos + 1);
+  }
+
+  // parse context
+  size_t l = prefix.find('.');
+  size_t r = prefix.rfind('.');
+  if (l == std::string::npos || r == std::string::npos || l+1 == r) {
+    context = context::none;
+  } else {
+    context = to_context(prefix.substr(l+1, r-l-1));
+  }
+  
+  // parse tenant
+  if (r == std::string::npos) {
+    tenant = "";
+  } else {
+    tenant = prefix.substr(r+1);
+  }
+}
+
+// Returns the oid key of a script list object based on its context and tenant
+// For example, the script list for the postrequest context and testx tenant
+// will return "metadata.script.postrequest.testx"
+// Also, the script list for the background context and global tenant
+// will return "metadata.script.background."
+std::string script_list_metadata_oid(context ctx, const std::string& tenant) {
+  static const std::string SCRIPT_LIST_METADATA_PREFIX("metadata.");
+  return SCRIPT_LIST_METADATA_PREFIX + script_oid(ctx, tenant, "");
+}
+
+// Returns the oid key of a script object based on its context, tenant, and name.
+// For example, a default (unnamed) script within the background context and testx tenant
+// will return "script.background.testx"
+// Also, a script named "myscript" in the prerequest context and global tenant
+// will return "script.prerequest..myscript"
+std::string script_oid(context ctx, const std::string& tenant, const std::string& name) {
   static const std::string SCRIPT_OID_PREFIX("script.");
+  if (!name.empty()) {
+    return SCRIPT_OID_PREFIX + to_string(ctx) + "." + tenant + "." + name;
+  }
   return SCRIPT_OID_PREFIX + to_string(ctx) + "." + tenant;
 }
 
-
-int read_script(const DoutPrefixProvider *dpp, sal::LuaManager* manager, const std::string& tenant, optional_yield y, context ctx, std::string& script)
+int read_script(const DoutPrefixProvider *dpp, sal::LuaManager* manager, optional_yield y, const std::string& tenant, context ctx, std::string& script, const std::string& name)
 {
-  return manager ? manager->get_script(dpp, y, script_oid(ctx, tenant), script) : -ENOENT;
+  return manager ? manager->get_script(dpp, y, nullptr, script_oid(ctx, tenant, name), script) : -ENOENT;
+}
+
+int list_scripts(const DoutPrefixProvider *dpp, sal::LuaManager* manager, optional_yield y, const std::string& tenant, context ctx, std::vector<std::string>& scripts)
+{
+  auto list_meta_key = script_list_metadata_oid (ctx, tenant);
+  return manager ? manager->list_scripts(dpp, y, list_meta_key, nullptr, scripts) : -ENOENT;
 }
 
 std::tuple<LuaCodeType, int> read_script_or_bytecode(const DoutPrefixProvider *dpp, sal::LuaManager* manager,
-                                                     const std::string& tenant, optional_yield y, context ctx)
+                                                     optional_yield y, const std::string& tenant, context ctx, const std::string& name)
 {
-  return manager ? manager->get_script_or_bytecode(dpp, y, script_oid(ctx, tenant)) : std::make_tuple("", -ENOENT);
+  return manager ? manager->get_script_or_bytecode(dpp, y, script_oid(ctx, tenant, name)) : std::make_tuple("", -ENOENT);
 }
 
-int write_script(const DoutPrefixProvider *dpp, sal::LuaManager* manager, const std::string& tenant, optional_yield y, context ctx, const std::string& script)
+int write_script(const DoutPrefixProvider *dpp, sal::LuaManager* manager, optional_yield y, const std::string& tenant, context ctx, const std::string& script, const std::string& name)
 {
-  return manager ? manager->put_script(dpp, y, script_oid(ctx, tenant), script) : -ENOENT;
+  return manager ? manager->put_script(dpp, y, script_oid(ctx, tenant, name), script) : -ENOENT;
 }
 
-int delete_script(const DoutPrefixProvider *dpp, sal::LuaManager* manager, const std::string& tenant, optional_yield y, context ctx)
+int delete_script(const DoutPrefixProvider *dpp, sal::LuaManager* manager, optional_yield y, const std::string& tenant, context ctx, const std::string& name)
 {
-  return manager ? manager->del_script(dpp, y, script_oid(ctx, tenant)) : -ENOENT;
+  return manager ? manager->del_script(dpp, y, script_oid(ctx, tenant, name)) : -ENOENT;
 }
 
 #ifdef WITH_RADOSGW_LUA_PACKAGES

@@ -12255,7 +12255,7 @@ next:
       return EINVAL;
     }
     auto lua_manager = driver->get_lua_manager("");
-    std::vector<std::shared_ptr<std::string>> scripts;
+    std::vector<std::string> scripts;
     const auto rc = rgw::lua::list_scripts(dpp(), lua_manager.get(), tenant, null_yield, script_ctx, scripts);
     if (rc < 0) {
       cerr << "ERROR: failed to list scripts. error: " << rc << std::endl;

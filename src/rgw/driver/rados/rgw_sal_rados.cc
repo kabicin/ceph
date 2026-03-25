@@ -5478,7 +5478,7 @@ int RadosLuaManager::get_script(const DoutPrefixProvider* dpp, optional_yield y,
   return 0;
 }
 
-int RadosLuaManager::list_scripts(const DoutPrefixProvider* dpp, optional_yield y, RGWObjVersionTracker* objv, const std::string& key, std::vector<std::shared_ptr<std::string>>& scripts) {
+int RadosLuaManager::list_scripts(const DoutPrefixProvider* dpp, optional_yield y, RGWObjVersionTracker* objv, const std::string& key, std::vector<std::string>& scripts) {
   if (pool.empty()) {
     ldpp_dout(dpp, 10) << "WARNING: missing pool when reading Lua script " << dendl;
     return 0;
@@ -5548,7 +5548,7 @@ std::tuple<rgw::lua::LuaCodeType, int> RadosLuaManager::get_script_or_bytecode(c
   return std::make_tuple(script, 0);
 }
 
-int RadosLuaManager::save_scripts(const DoutPrefixProvider* dpp, optional_yield y, RGWObjVersionTracker* objv, const std::vector<std::shared_ptr<std::string>>& scripts, const std::string& key) {
+int RadosLuaManager::save_scripts(const DoutPrefixProvider* dpp, optional_yield y, RGWObjVersionTracker* objv, const std::vector<std::string>& scripts, const std::string& key) {
   // create a bufferlist of scripts
   bufferlist bl;
   ceph::encode(scripts, bl);
@@ -5584,7 +5584,7 @@ int RadosLuaManager::put_script(const DoutPrefixProvider* dpp, optional_yield y,
   
   // read the script list
   RGWObjVersionTracker objv;
-  std::vector<std::shared_ptr<std::string>> scripts;
+  std::vector<std::string> scripts;
   int r = list_scripts(dpp, y, &objv, key, scripts);
   if (r < 0) {
     return r;
@@ -5627,7 +5627,7 @@ int RadosLuaManager::del_script(const DoutPrefixProvider* dpp, optional_yield y,
 
   // read the script list
   RGWObjVersionTracker objv;
-  std::vector<std::shared_ptr<std::string>> scripts;
+  std::vector<std::string> scripts;
   int r = list_scripts(dpp, y, &objv, key, scripts);
   if (r < 0) {
     return r;

@@ -391,7 +391,7 @@ int process_request(const RGWProcessEnv& penv,
   {
     s->trace_enabled = tracing::rgw::tracer.is_enabled();
     if (!is_health_request) {
-      std::vector<std::shared_ptr<std::string>> script_names;
+      std::vector<std::string> script_names;
       const auto rc = rgw::lua::list_scripts(s, penv.lua.manager.get(), s->bucket_tenant, s->yield, rgw::lua::context::preRequest, script_names);
       if (rc < 0) {
         ldpp_dout(op, 5) << "WARNING: failed to list data scripts. error " << rc << dendl;
@@ -459,7 +459,7 @@ done:
       }
     }
     if (!is_health_request) {
-      std::vector<std::shared_ptr<std::string>> script_names;
+      std::vector<std::string> script_names;
       const auto rc = rgw::lua::list_scripts(s, penv.lua.manager.get(), s->bucket_tenant, s->yield, rgw::lua::context::postRequest, script_names);
       if (rc < 0) {
         ldpp_dout(op, 5) << "WARNING: failed to list data scripts. error " << rc << dendl;

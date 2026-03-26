@@ -112,7 +112,7 @@ int Background::list_scripts(std::vector<std::string>& rgw_script_names) {
     return -EAGAIN;
   }
   std::string tenant;
-  return rgw::lua::list_scripts(&dp, lua_manager, tenant, null_yield, rgw::lua::context::background, rgw_script_names);
+  return rgw::lua::list_scripts(&dp, lua_manager, null_yield, tenant, rgw::lua::context::background, rgw_script_names);
 }
 
 int Background::read_script(const std::string& name) {
@@ -121,7 +121,7 @@ int Background::read_script(const std::string& name) {
     return -EAGAIN;
   }
   std::string tenant;
-  return rgw::lua::read_script(&dp, lua_manager, tenant, null_yield, rgw::lua::context::background, rgw_script, name);
+  return rgw::lua::read_script(&dp, lua_manager, null_yield, tenant, rgw::lua::context::background, rgw_script, name);
 }
 
 std::unique_ptr<lua_state_guard> Background::initialize_lguard_state() {
@@ -209,7 +209,8 @@ void Background::run() {
       if (rc == -ENOENT || rc == -EAGAIN) {
         // either no script or paused, nothing to do
         continue;
-      } else if (rc < 0) {
+      }
+      if (rc < 0) {
         ldpp_dout(dpp, 1) << "WARNING: failed to read background script. error " << rc << dendl;
         continue;
       }

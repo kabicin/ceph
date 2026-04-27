@@ -420,13 +420,16 @@ int process_request(const RGWProcessEnv& penv,
     s->trace_enabled = tracing::rgw::tracer.is_enabled();
     if (!is_health_request) {
       std::vector<std::string> script_names;
-      const auto rc = rgw::lua::list_scripts(s, penv.lua.manager.get(), s->yield, s->bucket_tenant, rgw::lua::context::preRequest, script_names);
+      const auto rc = rgw::lua::list_scripts(s, penv.lua.manager.get(), s->yield,
+                                                 s->bucket_tenant, rgw::lua::context::preRequest, script_names);
       // include the unnamed script for backward compatibility
       if (std::find(script_names.begin(), script_names.end(), "") == script_names.end()) {
         script_names.insert(script_names.begin(), "");
       }
       if (rc < 0 && rc != -ENOENT) {
-        ldpp_dout(op, 5) << "WARNING: failed to list data scripts. error " << rc << dendl;
+        ldpp_dout(op, 5) << "WARNING: failed to list data scripts in tenant " << s->bucket_tenant
+                                << " and context " << rgw::lua::to_string(rgw::lua::context::preRequest)
+                                << ". error " << rc << dendl;
       }
 
       for (const auto& name : script_names) {
@@ -438,9 +441,9 @@ int process_request(const RGWProcessEnv& penv,
           continue;
         }
         if (rc < 0) {
-          ldpp_dout(op, 5) <<
-            "WARNING: failed to read pre request script. "
-            "error: " << rc << dendl;
+          ldpp_dout(op, 5) << "WARNING: failed to read pre request script in tenant " << s->bucket_tenant
+                                  << " and context " << rgw::lua::to_string(rgw::lua::context::preRequest)
+                                  << ". error " << rc << dendl;
           continue;
         }
 
@@ -448,9 +451,9 @@ int process_request(const RGWProcessEnv& penv,
         rc = rgw::lua::request::execute(rest, penv.olog.get(), s, op, lua_script, script_return_code);
 
         if (rc < 0) {
-          ldpp_dout(op, 5) <<
-            "WARNING: failed to execute pre request script. "
-            "error: " << rc << dendl;
+          ldpp_dout(op, 5) << "WARNING: failed to execute pre request script in tenant " << s->bucket_tenant
+                                  << " and context " << rgw::lua::to_string(rgw::lua::context::preRequest)
+                                  << ". error " << rc << dendl;
         }
         if (script_return_code == -EPERM) {
           abort_early(s, op, script_return_code, handler, yield);
@@ -490,13 +493,16 @@ done:
     }
     if (!is_health_request) {
       std::vector<std::string> script_names;
-      const auto rc = rgw::lua::list_scripts(s, penv.lua.manager.get(), s->yield, s->bucket_tenant, rgw::lua::context::postRequest, script_names);
+      const auto rc = rgw::lua::list_scripts(s, penv.lua.manager.get(), s->yield,
+                                                 s->bucket_tenant, rgw::lua::context::postRequest, script_names);
       // include the unnamed script for backward compatibility
       if (std::find(script_names.begin(), script_names.end(), "") == script_names.end()) {
         script_names.insert(script_names.begin(), "");
       }
       if (rc < 0 && rc != -ENOENT) {
-        ldpp_dout(op, 5) << "WARNING: failed to list data scripts. error " << rc << dendl;
+        ldpp_dout(op, 5) << "WARNING: failed to list data scripts in tenant " << s->bucket_tenant
+                                << " and context " << rgw::lua::to_string(rgw::lua::context::postRequest)
+                                << ". error " << rc << dendl;
       }
 
       for (const auto& name : script_names) {
@@ -508,17 +514,17 @@ done:
           continue;
         }
         if (rc < 0) {
-          ldpp_dout(op, 5) <<
-            "WARNING: failed to read post request script. "
-            "error: " << rc << dendl;
+          ldpp_dout(op, 5) << "WARNING: failed to read post request script in tenant " << s->bucket_tenant
+                                  << " and context " << rgw::lua::to_string(rgw::lua::context::postRequest)
+                                  << ". error " << rc << dendl;
           continue;
         }
 
         rc = rgw::lua::request::execute(rest, penv.olog.get(), s, op, lua_script);
         if (rc < 0) {
-          ldpp_dout(op, 5) <<
-            "WARNING: failed to execute post request script. "
-            "error: " << rc << dendl;
+          ldpp_dout(op, 5) << "WARNING: failed to execute post request script in tenant " << s->bucket_tenant
+                                  << " and context " << rgw::lua::to_string(rgw::lua::context::postRequest)
+                                  << ". error " << rc << dendl;
         }
       }
     }

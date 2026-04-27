@@ -12253,7 +12253,9 @@ next:
       cerr << "ERROR: cannot specify tenant in background context" << std::endl;
       return EINVAL;
     }
-    if ((script_ctx == rgw::lua::context::getData || script_ctx == rgw::lua::context::putData) && !script_name.empty()) {
+    if ((script_ctx == rgw::lua::context::getData ||
+         script_ctx == rgw::lua::context::putData) &&
+        !script_name.empty()) {
       cerr << "ERROR: cannot create more than one Lua script in the " << *str_script_ctx << " context; remove the --script-name flag" << std::endl;
       return EINVAL;
     }
@@ -12275,8 +12277,10 @@ next:
       cerr << "ERROR: invalid script context: " << *str_script_ctx << ". must be one of: " << LUA_CONTEXT_LIST << std::endl;
       return EINVAL;
     }
-    if ((script_ctx == rgw::lua::context::getData || script_ctx == rgw::lua::context::putData) && !script_name.empty()) {
-      cerr << "ERROR: cannot create more than one Lua script in the " << *str_script_ctx << " context; remove the --script-name flag" << std::endl;
+    if ((script_ctx == rgw::lua::context::getData ||
+         script_ctx == rgw::lua::context::putData) &&
+        !script_name.empty()) {
+      cerr << "ERROR: cannot get more than one Lua script in the " << *str_script_ctx << " context; remove the --script-name flag" << std::endl;
       return EINVAL;
     }
     auto lua_manager = driver->get_lua_manager("");

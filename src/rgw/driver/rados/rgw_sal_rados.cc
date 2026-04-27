@@ -5580,6 +5580,7 @@ int RadosLuaManager::list_scripts(const DoutPrefixProvider* dpp, optional_yield 
   bufferlist bl;
   int r = rgw_get_system_obj(store->svc()->sysobj, pool, list_meta_key, bl, objv, nullptr, y, dpp);
   if (r < 0) {
+    ldpp_dout(dpp, 10) << "WARNING: failed to read Lua script metadata for " << list_meta_key << ", err:" << r << dendl;
     return r;
   }
 
@@ -5679,6 +5680,7 @@ int RadosLuaManager::put_script(const DoutPrefixProvider* dpp, optional_yield y,
   std::string list_meta_key = rgw::lua::script_list_metadata_oid(script_context, script_tenant);
   int r = list_scripts(dpp, y, list_meta_key, &objv, scripts);
   if (r < 0 && r != -ENOENT) {
+    ldpp_dout(dpp, 10) << "WARNING: failed to list Lua scripts for " << list_meta_key << ", err:" << r << dendl;
     return r;
   }
 
@@ -5687,6 +5689,7 @@ int RadosLuaManager::put_script(const DoutPrefixProvider* dpp, optional_yield y,
   ceph::encode(script, bl);
   r = rgw_put_system_obj(dpp, store->svc()->sysobj, pool, key, bl, false, nullptr, real_time(), y);
   if (r < 0) {
+    ldpp_dout(dpp, 10) << "WARNING: failed to write Lua script " << key << ", err:" << r << dendl;
     return r;
   }
 
@@ -5722,13 +5725,14 @@ int RadosLuaManager::del_script(const DoutPrefixProvider* dpp, optional_yield y,
   std::string list_meta_key = rgw::lua::script_list_metadata_oid(script_context, script_tenant);
   int r = list_scripts(dpp, y, list_meta_key, &objv, scripts);
   if (r < 0 && r != -ENOENT) {
+    ldpp_dout(dpp, 10) << "WARNING: failed to list Lua scripts for " << list_meta_key << ", err:" << r << dendl;
     return r;
   }
 
   // delete the script
   r = rgw_delete_system_obj(dpp, store->svc()->sysobj, pool, key, nullptr, y);
   if (r < 0 && r != -ENOENT) {
-    ldpp_dout(dpp, 10) << "WARNING: failed to delete Lua script " << key << dendl;
+    ldpp_dout(dpp, 10) << "WARNING: failed to delete Lua script " << key << ", err:" << r << dendl;
     return r;
   }
 

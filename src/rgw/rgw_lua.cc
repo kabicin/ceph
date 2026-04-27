@@ -87,33 +87,23 @@ bool verify(const std::string& script, std::string& err_msg)
 // Parses a script oid key into its context, tenant, and name
 void parse_script_oid(const std::string& key, context& context, std::string& tenant, std::string& name) {
   std::string prefix;
-  size_t p1 = key.find('.');
-  size_t p2 = (p1 != std::string::npos) ? key.find('.', p1 + 1) : std::string::npos;
-  size_t pos = (p2 != std::string::npos) ? key.find('.', p2 + 1) : std::string::npos;
-
-  // parse name and prefix
-  if (pos == std::string::npos) {
-    prefix = key;
+  size_t pos1 = key.find('.');
+  if (pos1 == std::string::npos || key.substr(0, pos1) != "script") {
+    return;
+  }
+  size_t pos2 = (pos1 != std::string::npos) ? key.find('.', pos1 + 1) : std::string::npos;
+  if (pos2 == std::string::npos) {
+    context = to_context(key.substr(pos1 + 1));
+  } else {
+    context = to_context(key.substr(pos1  + 1, pos2));
+  }
+  size_t pos3 = (pos2 != std::string::npos) ? key.find('.', pos2 + 1) : std::string::npos;
+  if (pos3 == std::string::npos) {
     name = "";
+    tenant = key.substr(pos2+1);
   } else {
-    prefix = key.substr(0, pos);
-    name = key.substr(pos + 1);
-  }
-
-  // parse context
-  size_t l = prefix.find('.');
-  size_t r = prefix.rfind('.');
-  if (l == std::string::npos || r == std::string::npos || l+1 == r) {
-    context = context::none;
-  } else {
-    context = to_context(prefix.substr(l+1, r-l-1));
-  }
-  
-  // parse tenant
-  if (r == std::string::npos) {
-    tenant = "";
-  } else {
-    tenant = prefix.substr(r+1);
+    name = key.substr(pos3+1);
+    tenant = key.substr(pos2+1, pos3);
   }
 }
 

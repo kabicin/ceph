@@ -177,6 +177,10 @@ private:
   void shutdown();
   void create_background_metatable(lua_State* L);
   const BackgroundMapValue& get_table_value(const std::string& key) const;
+  BackgroundMap get_background_map_snapshot() const {
+    std::unique_lock lock(table_mutex);
+    return rgw_map;
+  }
   template<typename T>
   void put_table_value(const std::string& key, T value) {
     std::unique_lock cond_lock(table_mutex);

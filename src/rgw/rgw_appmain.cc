@@ -81,6 +81,7 @@
 #include "rgw_sal_dbstore.h"
 #endif
 #include "rgw_lua_background.h"
+#include "rgw_rest_lua_prometheus.h"
 #include "services/svc_zone.h"
 
 #ifdef HAVE_SYS_PRCTL_H
@@ -423,6 +424,9 @@ void rgw::AppMain::cond_init_apis()
     if (apis_set.contains("zero")) {
       rest.register_resource("zero", new rgw::RESTMgr_Zero());
     }
+
+    rest.register_resource("metrics",
+        new rgw::lua::RESTMgr_LuaPrometheus());
   } /* have_http_frontend */
 } /* init_apis */
 

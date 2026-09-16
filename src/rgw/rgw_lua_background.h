@@ -9,15 +9,14 @@
 #include <boost/lockfree/queue.hpp>
 #include "rgw_lua_utils.h"
 #include "rgw_realm_reloader.h"
+#include "rgw_lua_map_socket.h"
+
+namespace rgw::lua { class MapUpdateServer; }
 
 namespace rgw::lua {
 
 //Interval between each execution of the script is set to 5 seconds
 constexpr const int INIT_EXECUTE_INTERVAL = 5;
-
-//Writeable meta table named RGW with mutex protection
-using BackgroundMapValue = std::variant<std::string, long long int, double, bool>;
-using BackgroundMap  = std::unordered_map<std::string, BackgroundMapValue>;
 
 struct RGWTable : EmptyMetaTable {
 
@@ -30,20 +29,23 @@ struct RGWTable : EmptyMetaTable {
     std::ignore = table_name_upvalue(L);
     const auto map = reinterpret_cast<BackgroundMap*>(lua_touserdata(L, lua_upvalueindex(SECOND_UPVAL)));
     auto& mtx = *reinterpret_cast<std::mutex*>(lua_touserdata(L, lua_upvalueindex(THIRD_UPVAL)));
+    const auto& socket_path = *reinterpret_cast<std::string*>(lua_touserdata(L, lua_upvalueindex(FOURTH_UPVAL)));
     const char* index = luaL_checkstring(L, 2);
 
     if (strcasecmp(index, INCREMENT) == 0) {
       lua_pushlightuserdata(L, map);
       lua_pushlightuserdata(L, &mtx);
+      lua_pushlightuserdata(L, const_cast<std::string*>(&socket_path));
       lua_pushboolean(L, false /*increment*/);
-      lua_pushcclosure(L, increment_by, THREE_UPVALS);
+      lua_pushcclosure(L, increment_by, FOUR_UPVALS);
       return ONE_RETURNVAL;
-    } 
+    }
     if (strcasecmp(index, DECREMENT) == 0) {
       lua_pushlightuserdata(L, map);
       lua_pushlightuserdata(L, &mtx);
+      lua_pushlightuserdata(L, const_cast<std::string*>(&socket_path));
       lua_pushboolean(L, true /*decrement*/);
-      lua_pushcclosure(L, increment_by, THREE_UPVALS);
+      lua_pushcclosure(L, increment_by, FOUR_UPVALS);
       return ONE_RETURNVAL;
     }
 
@@ -73,13 +75,12 @@ struct RGWTable : EmptyMetaTable {
     const auto name = table_name_upvalue(L);
     const auto map = reinterpret_cast<BackgroundMap*>(lua_touserdata(L, lua_upvalueindex(SECOND_UPVAL)));
     auto& mtx = *reinterpret_cast<std::mutex*>(lua_touserdata(L, lua_upvalueindex(THIRD_UPVAL)));
+    const auto& socket_path = *reinterpret_cast<std::string*>(lua_touserdata(L, lua_upvalueindex(FOURTH_UPVAL)));
     const auto index = luaL_checkstring(L, 2);
-    
+
     if (strcasecmp(index, INCREMENT) == 0 || strcasecmp(index, DECREMENT) == 0) {
         return luaL_error(L, "increment/decrement are reserved function names for RGW");
     }
-
-    std::unique_lock l(mtx);
 
     size_t len;
     BackgroundMapValue value;
@@ -88,9 +89,14 @@ struct RGWTable : EmptyMetaTable {
     switch (value_type) {
       case LUA_TNIL:
         // erase the element. since in lua: "t[index] = nil" is removing the entry at "t[index]"
-        if (const auto it = map->find(index); it != map->end()) {
-          // index was found
-          update_erased_iterator<BackgroundMap>(L, name, it, map->erase(it));
+        if (!socket_path.empty()) {
+          send_map_erase(socket_path, index);
+        } else {
+          std::lock_guard l(mtx);
+          if (const auto it = map->find(index); it != map->end()) {
+            // index was found
+            update_erased_iterator<BackgroundMap>(L, name, it, map->erase(it));
+          }
         }
         return NO_RETURNVAL;
       case LUA_TBOOLEAN:
@@ -113,7 +119,6 @@ struct RGWTable : EmptyMetaTable {
         break;
       }
       default:
-        l.unlock();
         return luaL_error(L, "unsupported value type for RGW table");
     }
 
@@ -121,9 +126,11 @@ struct RGWTable : EmptyMetaTable {
       > MAX_LUA_VALUE_SIZE) {
       return luaL_error(L, "Lua maximum size of entry limit exceeded");
     } else if (map->size() > MAX_LUA_KEY_ENTRIES) {
-      l.unlock();
       return luaL_error(L, "Lua max number of entries limit exceeded");
+    } else if (!socket_path.empty()) {
+      send_map_set(socket_path, index, value);
     } else {
+      std::unique_lock l(mtx);
       map->insert_or_assign(index, value);
     }
 
@@ -146,7 +153,7 @@ private:
   bool paused = false;
   int execute_interval;
   const DoutPrefix dp;
-  rgw::sal::LuaManager* lua_manager; 
+  rgw::sal::LuaManager* lua_manager;
   CephContext* const cct;
   std::thread runner;
   mutable std::mutex table_mutex;
@@ -158,6 +165,9 @@ private:
 //  bool updating = false;
   std::shared_mutex updating_mutex;
   boost::lockfree::queue<std::string*> processing_q{16};
+
+  std::unique_ptr<MapUpdateServer> map_server;
+  std::string map_socket_path;
 
   void run();
 
@@ -172,7 +182,7 @@ private:
              rgw::sal::LuaManager* _lua_manager,
              int _execute_interval = INIT_EXECUTE_INTERVAL);
 
-  ~Background() override = default;
+  ~Background() override;
   void start();
   void shutdown();
   void create_background_metatable(lua_State* L);
@@ -183,7 +193,9 @@ private:
     rgw_map[key] = value;
   }
 
-  // update the manager after 
+  const std::string& get_map_socket_path() const { return map_socket_path; }
+
+  // update the manager after
   void set_manager(rgw::sal::LuaManager* _lua_manager);
   void pause() override;
   // Does not actually use `Driver` argument.

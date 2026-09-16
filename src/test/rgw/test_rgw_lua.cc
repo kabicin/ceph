@@ -1920,3 +1920,142 @@ TEST(TestRGWLua, BucketTagsCount)
   const auto rc = lua::request::execute(nullptr, nullptr, &s, nullptr, script);
   ASSERT_EQ(rc, 0);
 }
+
+#include "rgw_lua_map_socket.h"
+
+template<typename Pred>
+static bool wait_for_condition(Pred pred, unsigned max_ms = 2000) {
+  for (unsigned i = 0; i < max_ms / 50; ++i) {
+    if (pred()) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  return pred();
+}
+
+TEST(TestRGWLuaMapSocket, SetGetErase)
+{
+  auto manager = std::make_unique<TestLuaManager>();
+  TestBackground bg(manager.get());
+  bg.start();
+
+  ASSERT_TRUE(wait_for_condition([&bg]{
+    return !bg.get_map_socket_path().empty();
+  }));
+
+  const std::string& path = bg.get_map_socket_path();
+
+  ASSERT_EQ(rgw::lua::send_map_set(path, "k1",
+    rgw::lua::BackgroundMapValue{std::string{"hello"}}), 0);
+  ASSERT_EQ(rgw::lua::send_map_set(path, "k2",
+    rgw::lua::BackgroundMapValue{static_cast<long long int>(42)}), 0);
+  ASSERT_EQ(rgw::lua::send_map_set(path, "k3",
+    rgw::lua::BackgroundMapValue{3.14}), 0);
+  ASSERT_EQ(rgw::lua::send_map_set(path, "k4",
+    rgw::lua::BackgroundMapValue{true}), 0);
+
+  ASSERT_TRUE(wait_for_condition([&bg]{
+    return std::holds_alternative<std::string>(bg.get_table_value("k1"));
+  }));
+
+  EXPECT_EQ(std::get<std::string>(bg.get_table_value("k1")), "hello");
+  EXPECT_EQ(std::get<long long int>(bg.get_table_value("k2")), 42);
+  EXPECT_DOUBLE_EQ(std::get<double>(bg.get_table_value("k3")), 3.14);
+  EXPECT_TRUE(std::get<bool>(bg.get_table_value("k4")));
+
+  ASSERT_EQ(rgw::lua::send_map_erase(path, "k1"), 0);
+  ASSERT_TRUE(wait_for_condition([&bg]{
+    auto v = bg.get_table_value("k1");
+    return std::holds_alternative<std::string>(v) &&
+           std::get<std::string>(v).empty();
+  }));
+  {
+    auto v = bg.get_table_value("k1");
+    ASSERT_TRUE(std::holds_alternative<std::string>(v));
+    EXPECT_TRUE(std::get<std::string>(v).empty());
+  }
+}
+
+TEST(TestRGWLuaMapSocket, Increment)
+{
+  auto manager = std::make_unique<TestLuaManager>();
+  TestBackground bg(manager.get());
+  bg.start();
+
+  ASSERT_TRUE(wait_for_condition([&bg]{
+    return !bg.get_map_socket_path().empty();
+  }));
+
+  const std::string& path = bg.get_map_socket_path();
+
+  ASSERT_EQ(rgw::lua::send_map_set(path, "counter",
+    rgw::lua::BackgroundMapValue{static_cast<long long int>(10)}), 0);
+
+  ASSERT_TRUE(wait_for_condition([&bg]{
+    return std::holds_alternative<long long int>(bg.get_table_value("counter"));
+  }));
+
+  ASSERT_EQ(rgw::lua::send_map_increment(path, "counter",
+    rgw::lua::BackgroundMapValue{static_cast<long long int>(5)}), 0);
+
+  ASSERT_TRUE(wait_for_condition([&bg]{
+    auto v = bg.get_table_value("counter");
+    return std::holds_alternative<long long int>(v) &&
+           std::get<long long int>(v) == 15;
+  }));
+  EXPECT_EQ(std::get<long long int>(bg.get_table_value("counter")), 15);
+
+  ASSERT_EQ(rgw::lua::send_map_increment(path, "counter",
+    rgw::lua::BackgroundMapValue{0.5}), 0);
+
+  ASSERT_TRUE(wait_for_condition([&bg]{
+    return std::holds_alternative<double>(bg.get_table_value("counter"));
+  }));
+  EXPECT_DOUBLE_EQ(std::get<double>(bg.get_table_value("counter")), 15.5);
+}
+
+TEST(TestRGWLuaMapSocket, ConcurrentSenders)
+{
+  auto manager = std::make_unique<TestLuaManager>();
+  TestBackground bg(manager.get());
+  bg.start();
+
+  ASSERT_TRUE(wait_for_condition([&bg]{
+    return !bg.get_map_socket_path().empty();
+  }));
+
+  const std::string& path = bg.get_map_socket_path();
+  constexpr int N = 20;
+
+  std::vector<std::thread> senders;
+  senders.reserve(N);
+  for (int i = 0; i < N; ++i) {
+    senders.emplace_back([&path, i]{
+      std::string key = "concurrent_" + std::to_string(i);
+      rgw::lua::send_map_set(path, key,
+        rgw::lua::BackgroundMapValue{static_cast<long long int>(i)});
+    });
+  }
+  for (auto& t : senders) t.join();
+
+  ASSERT_TRUE(wait_for_condition([&bg]{
+    for (int i = 0; i < N; ++i) {
+      std::string key = "concurrent_" + std::to_string(i);
+      if (!std::holds_alternative<long long int>(bg.get_table_value(key)))
+        return false;
+    }
+    return true;
+  }, 5000));
+
+  for (int i = 0; i < N; ++i) {
+    std::string key = "concurrent_" + std::to_string(i);
+    EXPECT_EQ(std::get<long long int>(bg.get_table_value(key)),
+              static_cast<long long int>(i));
+  }
+}
+
+TEST(TestRGWLuaMapSocket, SocketNotAvailableBeforeStart)
+{
+  auto manager = std::make_unique<TestLuaManager>();
+  TestBackground bg(manager.get());
+  EXPECT_TRUE(bg.get_map_socket_path().empty());
+}

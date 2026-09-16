@@ -1,10 +1,12 @@
 #include "driver/rados/rgw_sal_rados.h"
 #include "rgw_lua_background.h"
+#include "rgw_lua_map_socket.h"
 #include "rgw_lua.h"
 #include "rgw_lua_utils.h"
 #include "rgw_perf_counters.h"
 #include "include/ceph_assert.h"
 #include <lua.hpp>
+#include <fmt/format.h>
 
 #define dout_subsys ceph_subsys_rgw
 
@@ -16,7 +18,8 @@ const char* RGWTable::DECREMENT = "decrement";
 int RGWTable::increment_by(lua_State* L) {
   const auto map = reinterpret_cast<BackgroundMap*>(lua_touserdata(L, lua_upvalueindex(FIRST_UPVAL)));
   auto& mtx = *reinterpret_cast<std::mutex*>(lua_touserdata(L, lua_upvalueindex(SECOND_UPVAL)));
-  auto decrement = lua_toboolean(L, lua_upvalueindex(THIRD_UPVAL));
+  const auto& socket_path = *reinterpret_cast<std::string*>(lua_touserdata(L, lua_upvalueindex(THIRD_UPVAL)));
+  auto decrement = lua_toboolean(L, lua_upvalueindex(FOURTH_UPVAL));
 
   const auto args = lua_gettop(L);
   const auto index = luaL_checkstring(L, 1);
@@ -32,6 +35,19 @@ int RGWTable::increment_by(lua_State* L) {
     } else {
       return luaL_error(L, "can increment only by numeric values");
     }
+  }
+
+  if (!socket_path.empty()) {
+    std::lock_guard l(mtx);
+    const auto it = map->find(std::string(index));
+    if (it != map->end()) {
+      const auto& value = it->second;
+      if (!std::holds_alternative<double>(value) && !std::holds_alternative<long long int>(value)) {
+        return luaL_error(L, "can increment only numeric values");
+      }
+    }
+    send_map_increment(socket_path, index, inc_by);
+    return 0;
   }
 
   std::unique_lock l(mtx);
@@ -74,7 +90,15 @@ Background::Background(
     , cct(_cct)
 {}
 
+Background::~Background() {
+  shutdown();
+}
+
 void Background::shutdown(){
+  if (map_server) {
+    map_server->stop();
+    map_socket_path.clear();
+  }
   stopped = true;
   cond.notify_all();
   if (runner.joinable()) {
@@ -90,6 +114,17 @@ void Background::start() {
     return;
   }
   started = true;
+
+  map_socket_path = fmt::format("/tmp/rgw_lua_map_{}.sock",
+                                reinterpret_cast<uintptr_t>(this));
+  map_server = std::make_unique<MapUpdateServer>();
+  if (int rc = map_server->start(map_socket_path, &rgw_map, &table_mutex, &dp); rc < 0) {
+    ldpp_dout(&dp, 1) << "WARNING: failed to start map update socket server at "
+                      << map_socket_path << " rc=" << rc << dendl;
+    map_server.reset();
+    map_socket_path.clear();
+  }
+
   runner = std::thread(&Background::run, this);
 }
 
@@ -204,7 +239,7 @@ void Background::run() {
 
 void Background::create_background_metatable(lua_State* L) {
   static const char* background_table_name = "RGW";
-  create_metatable<RGWTable>(L, "", background_table_name, true, &rgw_map, &table_mutex);
+  create_metatable<RGWTable>(L, "", background_table_name, true, &rgw_map, &table_mutex, &map_socket_path);
   lua_getglobal(L, background_table_name);
   ceph_assert(lua_istable(L, -1));
 }

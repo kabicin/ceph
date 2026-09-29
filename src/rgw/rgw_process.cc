@@ -7,6 +7,7 @@
 #include "include/scope_guard.h"
 
 #include <utility>
+#include <chrono>
 #include "rgw_auth_registry.h"
 #include "rgw_dmclock_scheduler.h"
 #include "rgw_rest.h"
@@ -182,7 +183,8 @@ int rgw_process_authenticated(RGWHandler_REST * const handler,
                               req_state * const s,
 			                        optional_yield y,
                               rgw::sal::Driver* driver,
-                              const bool skip_retarget)
+                              const bool skip_retarget,
+                              RGWMetrics* metrics)
 {
   ldpp_dout(op, 2) << "init permissions" << dendl;
   int ret = handler->init_permissions(op, y);
@@ -284,7 +286,14 @@ int rgw_process_authenticated(RGWHandler_REST * const handler,
           "error: " << rc << dendl;
       } else {
         int script_return_code = 0;
+        auto start = std::chrono::steady_clock::now();
         rc = rgw::lua::request::execute(s->penv.rest, s->penv.olog.get(), s, op, script, script_return_code);
+        auto end = std::chrono::steady_clock::now();
+        double seconds = std::chrono::duration<double>(end-start).count();
+        if (metrics) {
+          metrics->luaPostAuths.count.Increment();
+          metrics->luaPostAuths.duration.Observe(seconds);
+        }
         if (rc < 0) {
           ldpp_dout(op, 5) <<
             "WARNING: failed to execute post authorization script. "
@@ -318,7 +327,8 @@ int process_request(const RGWProcessEnv& penv,
 		    rgw::dmclock::Scheduler *scheduler,
                     string* user,
                     ceph::coarse_real_clock::duration* latency,
-                    int* http_ret)
+                    int* http_ret,
+                    RGWMetrics* metrics)
 {
   int ret = client_io->init(g_ceph_context);
   rgw::sal::Driver* driver = penv.driver;
@@ -436,8 +446,17 @@ int process_request(const RGWProcessEnv& penv,
           "error: " << rc << dendl;
       } else {
         int script_return_code = 0;
-        rc = rgw::lua::request::execute(rest, penv.olog.get(), s, op, lua_script, script_return_code);
+        if (metrics) {
 
+        }
+        auto start = std::chrono::steady_clock::now();
+        rc = rgw::lua::request::execute(rest, penv.olog.get(), s, op, lua_script, script_return_code);
+        auto end = std::chrono::steady_clock::now();
+        double seconds = std::chrono::duration<double>(end-start).count();
+        if (metrics) {
+          metrics->luaPreRequests.count.Increment();
+          metrics->luaPreRequests.duration.Observe(seconds);
+        }
         if (rc < 0) {
           ldpp_dout(op, 5) <<
             "WARNING: failed to execute pre request script. "
@@ -453,7 +472,7 @@ int process_request(const RGWProcessEnv& penv,
     s->trace = tracing::rgw::tracer.start_trace(op->name(), s->trace_enabled);
     s->trace->SetAttribute(tracing::rgw::TRANS_ID, s->trans_id);
 
-    ret = rgw_process_authenticated(handler, op, req, s, yield, driver);
+    ret = rgw_process_authenticated(handler, op, req, s, yield, driver, metrics);
     if (ret < 0) {
       abort_early(s, op, ret, handler, yield);
       goto done;
@@ -490,7 +509,14 @@ done:
           "WARNING: failed to read post request script. "
           "error: " << rc << dendl;
       } else {
+        auto start = std::chrono::steady_clock::now();
         rc = rgw::lua::request::execute(rest, penv.olog.get(), s, op, lua_script);
+        auto end = std::chrono::steady_clock::now();
+        double seconds = std::chrono::duration<double>(end-start).count();
+        if (metrics) {
+          metrics->luaPostRequests.count.Increment();
+          metrics->luaPostRequests.duration.Observe(seconds);
+        }
         if (rc < 0) {
           ldpp_dout(op, 5) <<
             "WARNING: failed to execute post request script. "

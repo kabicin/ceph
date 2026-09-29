@@ -48,3 +48,4 @@ install(TARGETS
   ceph_test_rados_list_parallel
   ceph_test_rados_open_pools_parallel
   DESTINATION ${CMAKE_INSTALL_BINDIR})
+

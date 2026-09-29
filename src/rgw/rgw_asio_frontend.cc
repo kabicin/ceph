@@ -29,6 +29,7 @@
 #include "common/errno.h"
 #include "common/strtol.h"
 
+#include "rgw_metrics.h"
 #include "rgw_asio_client.h"
 #include "rgw_asio_frontend.h"
 #include "rgw_asio_thread.h"
@@ -254,6 +255,7 @@ void handle_connection(boost::asio::io_context& context,
                        parse_buffer& buffer, bool is_ssl,
                        SharedMutex& pause_mutex,
                        rgw::dmclock::Scheduler *scheduler,
+                       RGWMetrics& metrics,
                        const std::string& uri_prefix,
                        boost::system::error_code& ec,
                        boost::asio::yield_context yield)
@@ -351,8 +353,9 @@ void handle_connection(boost::asio::io_context& context,
       string user = "-";
       const auto started = ceph::coarse_real_clock::now();
       ceph::coarse_real_clock::duration latency{};
+
       process_request(env, &req, uri_prefix, &client, y,
-                      scheduler, &user, &latency, &http_ret);
+                      scheduler, &user, &latency, &http_ret, &metrics);
 
       if (cct->_conf->subsys.should_gather(ceph_subsys_rgw_access, 1)) {
         // access log line elements begin per Apache Combined Log Format with additions following
@@ -436,6 +439,7 @@ class AsioFrontend {
 #endif
   SharedMutex pause_mutex;
   std::unique_ptr<rgw::dmclock::Scheduler> scheduler;
+  RGWMetrics& metrics;
 
   struct Listener {
     tcp::endpoint endpoint;
@@ -471,6 +475,7 @@ class AsioFrontend {
       ssl_reload_timer(context),
 #endif
       pause_mutex(context.get_executor()),
+      metrics(rgw_metrics_service().get_counters()),
       backoff(context)
   {
     auto sched_t = dmc::get_scheduler_t(ctx());
@@ -1191,7 +1196,7 @@ void AsioFrontend::on_accept(Listener& l, tcp::socket stream)
         }
         conn->buffer.consume(bytes);
         handle_connection(context, env, stream, timeout, header_limit,
-                          conn->buffer, true, pause_mutex, scheduler.get(),
+                          conn->buffer, true, pause_mutex, scheduler.get(), metrics,
                           uri_prefix, ec, yield);
 
         if (!ec || ec == http::error::end_of_stream) {
@@ -1214,7 +1219,7 @@ void AsioFrontend::on_accept(Listener& l, tcp::socket stream)
         auto timeout = timeout_timer{yield.get_executor(), request_timeout, conn};
         boost::system::error_code ec;
         handle_connection(context, env, conn->socket, timeout, header_limit,
-                          conn->buffer, false, pause_mutex, scheduler.get(),
+                          conn->buffer, false, pause_mutex, scheduler.get(), metrics,
                           uri_prefix, ec, yield);
         conn->socket.shutdown(tcp::socket::shutdown_both, ec);
       }, [] (std::exception_ptr eptr) {

@@ -315,7 +315,8 @@ list(APPEND librgw_d4n_srcs
   driver/d4n/d4n_policy.cc
   driver/d4n/rgw_sal_d4n.cc)
 
-set(rgw_common_libs)
+find_package(TBB REQUIRED)
+set(rgw_common_libs TBB::tbb)
 
 if(WITH_RADOSGW_RADOS)
   list(APPEND librgw_driver_srcs ${librgw_rados_srcs})

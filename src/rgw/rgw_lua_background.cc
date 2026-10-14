@@ -10,6 +10,63 @@
 
 namespace rgw::lua {
 
+struct RGWTableSnapshot {
+  std::vector<std::string> keys;
+  size_t pos = 0;
+};
+
+int RGWTable::PairsClosure(lua_State *L) {
+  std::ignore = table_name_upvalue(L);
+  auto map = reinterpret_cast<BackgroundMap*>(lua_touserdata(L, lua_upvalueindex(SECOND_UPVAL)));
+  auto& mtx = *reinterpret_cast<std::shared_mutex*>(lua_touserdata(L, lua_upvalueindex(THIRD_UPVAL)));
+  auto snapshot = new (lua_newuserdata(L, sizeof(RGWTableSnapshot))) RGWTableSnapshot{};
+  if(luaL_newmetatable(L, "RGW.Snapshot")) {
+    lua_pushcfunction(L, [](lua_State* L) {
+      static_cast<RGWTableSnapshot*>(lua_touserdata(L, 1))->~RGWTableSnapshot();
+      return 0;
+    });
+    lua_setfield(L, -2, "__gc");
+  }
+  lua_setmetatable(L, -2);
+
+
+  {
+    std::unique_lock l(mtx);
+    snapshot->keys.reserve(map->size());
+    for (const auto& [k, v] : *map) {
+      snapshot->keys.push_back(k);
+    }
+  }
+
+  lua_pushlightuserdata(L, map);
+  lua_pushcclosure(L, snapshot_next, ONE_UPVAL);
+  lua_insert(L, -2);
+  lua_pushnil(L);
+  return THREE_RETURNVALS;
+}
+
+int RGWTable::snapshot_next(lua_State* L) {
+  auto map = reinterpret_cast<BackgroundMap*>(lua_touserdata(L, lua_upvalueindex(FIRST_UPVAL)));
+  auto snapshot = static_cast<RGWTableSnapshot*>(luaL_checkudata(L, 1, "RGW.Snapshot"));
+
+  while (snapshot->pos < snapshot->keys.size()) {
+    const auto& key = snapshot->keys[snapshot->pos++];
+    BackgroundMapValue value;
+    {
+      BackgroundMap::const_accessor a;
+      if (!map->find(a, key)) {
+        continue;
+      }
+      value = a->second;
+    }
+    pushstring(L, key);
+    std::visit([L](auto&& v) { pushvalue(L, v); }, value);
+    return TWO_RETURNVALS;
+  }
+  lua_pushnil(L);
+  return ONE_RETURNVAL;
+}
+
 const char* RGWTable::INCREMENT = "increment";
 const char* RGWTable::DECREMENT = "decrement";
 

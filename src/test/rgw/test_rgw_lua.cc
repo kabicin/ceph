@@ -1288,16 +1288,17 @@ TEST(TestRGWLuaBackground, TableIterateWriteMiddleElement)
     local total = #RGW
     local middle = total // 2 + 1
     local counter = 0
+    local erased_key
     for k, v in pairs(RGW) do
       counter = counter + 1
       if counter == middle then
-        local erased_key = tostring(k)
+        erased_key = k
         RGW[erased_key] = nil
-        print("middle element '" .. erased_key .. "' is deleted and iterator moves")
-        assert(tostring(k) ~= erased_key)
+        print("middle element '" .. erased_key .. "' is deleted")
       end
     end
-    assert(counter == total - 1)
+    assert(counter == total)
+    assert(RGW[erased_key] == nil)
   )";
 
   pe.lua.background = &lua_background;
@@ -1306,7 +1307,7 @@ TEST(TestRGWLuaBackground, TableIterateWriteMiddleElement)
   ASSERT_EQ(rc, 0);
 }
 
-TEST(TestRGWLuaBackground, TableIterateWriteLastElement)
+TEST(TestRGWLuaBackground, TableIterateWriteFutureElement)
 {
   DEFINE_REQ_STATE;
   TestBackground lua_background(pe.lua.manager.get());
@@ -1319,40 +1320,26 @@ TEST(TestRGWLuaBackground, TableIterateWriteLastElement)
     RGW["e"] = 5
     local total = #RGW
     local counter = 0
+    local erased_key
+    local seen = {}
     for k, v in pairs(RGW) do
       counter = counter + 1
-      if counter == total then
-        local erased_key = tostring(k)
+      seen[k] = true
+      if counter == 1 then
+        -- on the first step every other key is still ahead of the iteration
+        for _, key in ipairs({"a", "b", "c", "d", "e"}) do
+          if key ~= k then
+            erased_key = key
+            break
+          end
+        end
         RGW[erased_key] = nil
-        print("last element '" .. erased_key .. "' is deleted and iterator becomes end")
-        assert(tostring(k) == "nil")
+        print("future element '" .. erased_key .. "' is deleted")
       end
     end
-    assert(counter == total)
-  )";
-
-  pe.lua.background = &lua_background;
-
-  const auto rc = lua::request::execute(nullptr, nullptr, &s, nullptr, request_script);
-  ASSERT_EQ(rc, 0);
-}
-
-TEST(TestRGWLuaBackground, TableIterateWriteOneElement)
-{
-  DEFINE_REQ_STATE;
-  TestBackground lua_background(pe.lua.manager.get());
-
-  const std::string request_script = R"(
-    RGW["a"] = 1
-    local counter = 0
-    for k, v in pairs(RGW) do
-      counter = counter + 1
-      local erased_key = tostring(k)
-      RGW[erased_key] = nil
-      print("only element '" .. erased_key .. "' is deleted and iterator becomes end")
-      assert(tostring(k) == "nil")
-    end
-    assert(counter == 1)
+    assert(counter == total - 1)
+    assert(not seen[erased_key])
+    assert(RGW[erased_key] == nil)
   )";
 
   pe.lua.background = &lua_background;

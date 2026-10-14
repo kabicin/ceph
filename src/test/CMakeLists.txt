@@ -386,9 +386,8 @@ target_link_libraries(ceph_test_librgw_file_nfsns
   ${UNITTEST_LIBS}
   ${EXTRALIBS}
   ${LUA_LIBRARIES}
-  ${ALLOC_LIBS}
-  )
-  target_link_libraries(ceph_test_librgw_file_nfsns Boost::context)
+  ${ALLOC_LIBS})
+target_link_libraries(ceph_test_librgw_file_nfsns Boost::context prometheus-cpp::core prometheus-cpp::pull)
 install(TARGETS ceph_test_librgw_file_nfsns DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # ceph_test_librgw_file_aw (nfs write transaction [atomic write] tests)
@@ -440,8 +439,9 @@ target_link_libraries(ceph_test_librgw_file_xattr
   ${EXTRALIBS}
   ${LUA_LIBRARIES}
   ${ALLOC_LIBS}
+  prometheus-cpp::core
+  prometheus-cpp::pull
   )
-target_link_libraries(ceph_test_librgw_file_xattr Boost::context)
 
 # ceph_test_librgw_file_rename (mv/rename tests)
 add_executable(ceph_test_librgw_file_rename

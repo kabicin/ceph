@@ -45,13 +45,15 @@ struct RGWTable : EmptyMetaTable {
       return ONE_RETURNVAL;
     }
 
+    BackgroundMapValue value;
     BackgroundMap::const_accessor accessor;
-
-    if (map->find(accessor, std::string(index))) {
-      std::visit([L](auto&& value) { pushvalue(L, value); }, accessor->second);
-    } else {
+    if (!map->find(accessor, std::string(index))) {
       lua_pushnil(L);
+      return ONE_RETURNVAL;
     }
+    value = accessor->second;
+    accessor.release();
+    std::visit([L](auto&& value) { pushvalue(L, value); }, value);
     return ONE_RETURNVAL;
   }
 
@@ -64,9 +66,9 @@ struct RGWTable : EmptyMetaTable {
   }
 
   static int NewIndexClosure(lua_State* L) {
-    const auto name = table_name_upvalue(L);
+    std::ignore = table_name_upvalue(L);
     const auto map = reinterpret_cast<BackgroundMap*>(lua_touserdata(L, lua_upvalueindex(SECOND_UPVAL)));
-    auto& mtx = *reinterpret_cast<std::mutex*>(lua_touserdata(L, lua_upvalueindex(THIRD_UPVAL)));
+    auto& mtx = *reinterpret_cast<std::shared_mutex*>(lua_touserdata(L, lua_upvalueindex(THIRD_UPVAL)));
     const auto index = luaL_checkstring(L, 2);
     
     if (strcasecmp(index, INCREMENT) == 0 || strcasecmp(index, DECREMENT) == 0) {
@@ -81,17 +83,8 @@ struct RGWTable : EmptyMetaTable {
       case LUA_TNIL:
         // erase the element. since in lua: "t[index] = nil" is removing the entry at "t[index]"
         {
-          std::lock_guard l(mtx);
-          const std::string key = std::string(index);
-          for (auto it = map->begin(); it != map->end(); ++it) {
-            if (it->first == key) {
-              auto next_it = it;
-              ++next_it;
-              update_erased_iterator<BackgroundMap>(L, name, it, next_it);
-              map->erase(key);
-              break;
-            }
-          }
+          std::shared_lock l(mtx);
+          map->erase(index);
         }
         return NO_RETURNVAL;
       case LUA_TBOOLEAN:
@@ -123,6 +116,7 @@ struct RGWTable : EmptyMetaTable {
     } else if (map->size() > MAX_LUA_KEY_ENTRIES) {
       return luaL_error(L, "Lua max number of entries limit exceeded");
     } else {
+      std::shared_lock l(mtx);
       BackgroundMap::accessor accessor;
       map->insert(accessor, std::string(index));
       accessor->second = value;
@@ -131,9 +125,8 @@ struct RGWTable : EmptyMetaTable {
     return NO_RETURNVAL;
   }
 
-  static int PairsClosure(lua_State* L) {
-    return Pairs<BackgroundMap>(L);
-  }
+  static int PairsClosure(lua_State* L);
+  static int snapshot_next(lua_State* L);
 };
 
 class Background : public RGWRealmReloader::Pauser {
@@ -150,7 +143,7 @@ private:
   rgw::sal::LuaManager* lua_manager; 
   CephContext* const cct;
   std::thread runner;
-  mutable std::mutex table_mutex;
+  std::shared_mutex table_mutex;
   std::mutex cond_mutex;
   std::mutex pause_mutex;
   std::condition_variable cond;
@@ -181,6 +174,7 @@ private:
 
   template<typename T>
   void put_table_value(const std::string& key, T value) {
+    std::shared_lock l(table_mutex);
     BackgroundMap::accessor accessor;
     rgw_map.insert(accessor, key);
     accessor->second = value;

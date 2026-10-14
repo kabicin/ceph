@@ -14,6 +14,9 @@
 
 #include <atomic>
 
+#include "rgw_metrics.h"
+#include <prometheus/registry.h>
+
 #define dout_context g_ceph_context
 
 
@@ -146,7 +149,8 @@ extern int process_request(const RGWProcessEnv& penv,
                            rgw::dmclock::Scheduler *scheduler,
                            std::string* user,
                            ceph::coarse_real_clock::duration* latency,
-                           int* http_ret = nullptr);
+                           int* http_ret = nullptr,
+                           RGWMetrics* metrics = nullptr);
 
 extern int rgw_process_authenticated(RGWHandler_REST* handler,
                                      RGWOp*& op,
@@ -154,6 +158,7 @@ extern int rgw_process_authenticated(RGWHandler_REST* handler,
                                      req_state* s,
 				                             optional_yield y,
                                      rgw::sal::Driver* driver,
-                                     bool skip_retarget = false);
+                                     bool skip_retarget = false,
+                                     RGWMetrics* metrics = nullptr);
 
 #undef dout_context

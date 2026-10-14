@@ -156,7 +156,8 @@ set(librgw_common_srcs
   rgw_bucket_logging.cc
   rgw_rest_bucket_logging.cc
   rgw_bucket_sync.cc
-  rgw_rest_restore.cc)
+  rgw_rest_restore.cc
+  rgw_metrics.cc)
 
 list(APPEND librgw_common_srcs
   driver/immutable_config/store.cc
@@ -443,6 +444,22 @@ if(WITH_JAEGER)
   target_link_libraries(rgw_common PUBLIC jaeger_base)
 endif()
 
+include(FetchContent)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(ENABLE_PUSH OFF CACHE BOOL "" FORCE)
+set(ENABLE_PULL ON CACHE BOOL "" FORCE)
+set(ENABLE_COMPRESSION OFF CACHE BOOL "" FORCE)
+set(ENABLE_TESTING OFF CACHE BOOL "Dependency tests" FORCE)
+set(THIRDPARTY_CIVETWEB_WITH_SSL OFF CACHE BOOL "" FORCE)
+set(OVERRIDE_CXX_STANDARD_FLAGS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(prometheus-cpp
+    GIT_REPOSITORY https://github.com/jupp0r/prometheus-cpp.git
+    GIT_TAG e5fada43131d251e9c4786b04263ce98b6767ba5 # v1.3.0
+    GIT_SUBMODULES 3rdparty/civetweb
+    GIT_SUBMODULES_RECURSE OFF)
+FetchContent_MakeAvailable(prometheus-cpp)
+target_link_libraries(rgw_common PUBLIC prometheus-cpp::core prometheus-cpp::pull)
+
 if(WITH_RADOSGW_RADOS)
   target_link_libraries(rgw_common PRIVATE
 	  cls_2pc_queue_client
@@ -509,7 +526,9 @@ if(WITH_RADOSGW_STANDALONE)
     Boost::url
     ${FMT_LIB}
     OpenSSL::SSL
-    BLAKE3::blake3)
+    BLAKE3::blake3
+    prometheus-cpp::core
+    prometheus-cpp::pull)
   target_include_directories(rgw_common_standalone
     PUBLIC "${CMAKE_SOURCE_DIR}/src/rgw/services"
     PUBLIC "${CMAKE_SOURCE_DIR}/src/rgw"
@@ -1117,7 +1136,9 @@ target_link_libraries(rgw
   OpenSSL::SSL
   PUBLIC
   RapidJSON::RapidJSON
-  dmclock::dmclock)
+  dmclock::dmclock
+  prometheus-cpp::core
+  prometheus-cpp::pull)
 
 if(WITH_RADOSGW_AMQP_ENDPOINT)
   target_link_libraries(rgw PRIVATE RabbitMQ::RabbitMQ)

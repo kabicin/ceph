@@ -1632,6 +1632,108 @@ TEST(TestRGWLuaBackground, TableIterateStepByStep)
   lua_background.shutdown();
 }
 
+TEST(TestRGWLuaBackground, KeySnapshotSharedWhileKeysUnchanged)
+{
+  DEFINE_REQ_STATE;
+  TestBackground lua_background(pe.lua.manager.get());
+  pe.lua.background = &lua_background;
+
+  ASSERT_EQ(lua::request::execute(nullptr, nullptr, &s, nullptr, "RGW['a'] = 1; RGW['b'] = 2"), 0);
+  const auto first = lua_background.get_key_snapshot();
+  ASSERT_EQ(first->keys.size(), 2);
+
+  ASSERT_EQ(lua::request::execute(nullptr, nullptr, &s, nullptr,
+        "RGW['a'] = 10; RGW.increment('b'); RGW['missing'] = nil"), 0);
+  lua_background.put_table_value("a", 7LL);
+  EXPECT_EQ(lua_background.get_key_snapshot(), first);
+}
+
+TEST(TestRGWLuaBackground, KeySnapshotRebuiltOnNewKey)
+{
+  DEFINE_REQ_STATE;
+  TestBackground lua_background(pe.lua.manager.get());
+  pe.lua.background = &lua_background;
+
+  ASSERT_EQ(lua::request::execute(nullptr, nullptr, &s, nullptr, "RGW['a'] = 1"), 0);
+  const auto first = lua_background.get_key_snapshot();
+
+  ASSERT_EQ(lua::request::execute(nullptr, nullptr, &s, nullptr, "RGW['b'] = 2"), 0);
+  const auto second = lua_background.get_key_snapshot();
+  EXPECT_NE(second, first);
+  EXPECT_EQ(second->keys.size(), 2);
+
+  lua_background.put_table_value("c", 3LL);
+  const auto third = lua_background.get_key_snapshot();
+  EXPECT_NE(third, second);
+  EXPECT_EQ(third->keys.size(), 3);
+}
+
+TEST(TestRGWLuaBackground, KeySnapshotRebuiltOnErase)
+{
+  DEFINE_REQ_STATE;
+  TestBackground lua_background(pe.lua.manager.get());
+  pe.lua.background = &lua_background;
+
+  ASSERT_EQ(lua::request::execute(nullptr, nullptr, &s, nullptr, "RGW['a'] = 1; RGW['b'] = 2"), 0);
+  const auto first = lua_background.get_key_snapshot();
+
+  ASSERT_EQ(lua::request::execute(nullptr, nullptr, &s, nullptr, "RGW['a'] = nil"), 0);
+  const auto second = lua_background.get_key_snapshot();
+  EXPECT_NE(second, first);
+  ASSERT_EQ(second->keys.size(), 1);
+  EXPECT_EQ(second->keys[0], "b");
+}
+
+TEST(TestRGWLuaBackground, TableIteratePairsSeesOwnWrites)
+{
+  DEFINE_REQ_STATE;
+  TestBackground lua_background(pe.lua.manager.get());
+  pe.lua.background = &lua_background;
+
+  const std::string request_script = R"(
+    local function count()
+      local n = 0
+      for _ in pairs(RGW) do n = n + 1 end
+      return n
+    end
+    RGW["a"] = 1
+    assert(count() == 1)
+    RGW["b"] = 2
+    assert(count() == 2)
+    RGW["a"] = nil
+    assert(count() == 1)
+  )";
+
+  const auto rc = lua::request::execute(nullptr, nullptr, &s, nullptr, request_script);
+  ASSERT_EQ(rc, 0);
+}
+
+TEST(TestRGWLuaBackground, KeySnapshotConcurrentWriters)
+{
+  auto manager = std::make_unique<TestLuaManager>();
+  TestBackground lua_background(manager.get());
+
+  constexpr int writers = 4;
+  constexpr int keys_per_writer = 500;
+  std::vector<std::thread> threads;
+  for (int w = 0; w < writers; ++w) {
+    threads.emplace_back([&lua_background, w] {
+      for (int i = 0; i < keys_per_writer; ++i) {
+        lua_background.put_table_value(fmt::format("w{}-k{}", w, i), static_cast<long long int>(i));
+      }
+    });
+  }
+  for (int i = 0; i < 200; ++i) {
+    const auto snapshot = lua_background.get_key_snapshot();
+    std::set<std::string> unique(snapshot->keys.begin(), snapshot->keys.end());
+    EXPECT_EQ(unique.size(), snapshot->keys.size());
+  }
+  for (auto& t : threads) {
+    t.join();
+  }
+  EXPECT_EQ(lua_background.get_key_snapshot()->keys.size(), writers * keys_per_writer);
+}
+
 TEST(TestRGWLua, TracingSetAttribute)
 {
   const std::string script = R"(

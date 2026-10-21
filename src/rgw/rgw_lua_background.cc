@@ -10,8 +10,27 @@
 
 namespace rgw::lua {
 
-struct RGWTableSnapshot {
-  std::vector<std::string> keys;
+std::shared_ptr<const BackgroundKeySnapshot> BackgroundKeySnapshotCache::get(
+    const BackgroundMap& map, std::shared_mutex& table_mutex) {
+  std::lock_guard l(mtx);
+  if (current && current->generation == generation.load(std::memory_order_acquire)) {
+    return current;
+  }
+  auto snapshot = std::make_shared<BackgroundKeySnapshot>();
+  {
+    std::unique_lock tl(table_mutex);
+    snapshot->generation = generation.load(std::memory_order_acquire);
+    snapshot->keys.reserve(map.size());
+    for (const auto& [k, v] : map) {
+      snapshot->keys.push_back(k);
+    }
+  }
+  current = std::move(snapshot);
+  return current;
+}
+
+struct RGWTableIterator {
+  std::shared_ptr<const BackgroundKeySnapshot> snapshot;
   size_t pos = 0;
 };
 
@@ -19,24 +38,18 @@ int RGWTable::PairsClosure(lua_State *L) {
   std::ignore = table_name_upvalue(L);
   auto map = reinterpret_cast<BackgroundMap*>(lua_touserdata(L, lua_upvalueindex(SECOND_UPVAL)));
   auto& mtx = *reinterpret_cast<std::shared_mutex*>(lua_touserdata(L, lua_upvalueindex(THIRD_UPVAL)));
-  auto snapshot = new (lua_newuserdata(L, sizeof(RGWTableSnapshot))) RGWTableSnapshot{};
-  if(luaL_newmetatable(L, "RGW.Snapshot")) {
+  auto snapshots = reinterpret_cast<BackgroundKeySnapshotCache*>(lua_touserdata(L, lua_upvalueindex(FOURTH_UPVAL)));
+  auto iterator = new (lua_newuserdata(L, sizeof(RGWTableIterator))) RGWTableIterator{};
+  if(luaL_newmetatable(L, "RGW.Iterator")) {
     lua_pushcfunction(L, [](lua_State* L) {
-      static_cast<RGWTableSnapshot*>(lua_touserdata(L, 1))->~RGWTableSnapshot();
+      static_cast<RGWTableIterator*>(lua_touserdata(L, 1))->~RGWTableIterator();
       return 0;
     });
     lua_setfield(L, -2, "__gc");
   }
   lua_setmetatable(L, -2);
 
-
-  {
-    std::unique_lock l(mtx);
-    snapshot->keys.reserve(map->size());
-    for (const auto& [k, v] : *map) {
-      snapshot->keys.push_back(k);
-    }
-  }
+  iterator->snapshot = snapshots->get(*map, mtx);
 
   lua_pushlightuserdata(L, map);
   lua_pushcclosure(L, snapshot_next, ONE_UPVAL);
@@ -47,10 +60,10 @@ int RGWTable::PairsClosure(lua_State *L) {
 
 int RGWTable::snapshot_next(lua_State* L) {
   auto map = reinterpret_cast<BackgroundMap*>(lua_touserdata(L, lua_upvalueindex(FIRST_UPVAL)));
-  auto snapshot = static_cast<RGWTableSnapshot*>(luaL_checkudata(L, 1, "RGW.Snapshot"));
+  auto iterator = static_cast<RGWTableIterator*>(luaL_checkudata(L, 1, "RGW.Iterator"));
 
-  while (snapshot->pos < snapshot->keys.size()) {
-    const auto& key = snapshot->keys[snapshot->pos++];
+  while (iterator->snapshot && iterator->pos < iterator->snapshot->keys.size()) {
+    const auto& key = iterator->snapshot->keys[iterator->pos++];
     BackgroundMapValue value;
     {
       BackgroundMap::const_accessor a;
@@ -63,6 +76,7 @@ int RGWTable::snapshot_next(lua_State* L) {
     std::visit([L](auto&& v) { pushvalue(L, v); }, value);
     return TWO_RETURNVALS;
   }
+  iterator->snapshot.reset();
   lua_pushnil(L);
   return ONE_RETURNVAL;
 }
@@ -195,6 +209,10 @@ std::unique_ptr<lua_state_guard> Background::initialize_lguard_state() {
 
 const BackgroundMapValue Background::empty_table_value;
 
+std::shared_ptr<const BackgroundKeySnapshot> Background::get_key_snapshot() {
+  return key_snapshots.get(rgw_map, table_mutex);
+}
+
 BackgroundMapValue Background::get_table_value(const std::string& key) const {
   BackgroundMap::const_accessor accessor;
   if (rgw_map.find(accessor, key)) {
@@ -257,7 +275,7 @@ void Background::run() {
 
 void Background::create_background_metatable(lua_State* L) {
   static const char* background_table_name = "RGW";
-  create_metatable<RGWTable>(L, "", background_table_name, true, &rgw_map, &table_mutex);
+  create_metatable<RGWTable>(L, "", background_table_name, true, &rgw_map, &table_mutex, &key_snapshots);
   lua_getglobal(L, background_table_name);
   ceph_assert(lua_istable(L, -1));
 }

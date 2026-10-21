@@ -1,8 +1,11 @@
 #pragma once
 #include "common/dout.h"
 #include "rgw_common.h"
+#include <atomic>
+#include <memory>
 #include <string>
 #include <set>
+#include <vector>
 #include <variant>
 #include <shared_mutex>
 #include <mutex>
@@ -19,6 +22,24 @@ constexpr const int INIT_EXECUTE_INTERVAL = 5;
 //Writeable meta table named RGW
 using BackgroundMapValue = std::variant<std::string, long long int, double, bool>;
 using BackgroundMap = tbb::concurrent_hash_map<std::string, BackgroundMapValue>;
+
+struct BackgroundKeySnapshot {
+  std::vector<std::string> keys;
+  uint64_t generation = 0;
+};
+
+class BackgroundKeySnapshotCache {
+  std::atomic<uint64_t> generation{0};
+  std::mutex mtx;
+  std::shared_ptr<const BackgroundKeySnapshot> current;
+
+public:
+  void key_set_changed() {
+    generation.fetch_add(1, std::memory_order_release);
+  }
+
+  std::shared_ptr<const BackgroundKeySnapshot> get(const BackgroundMap& map, std::shared_mutex& table_mutex);
+};
 
 struct RGWTable : EmptyMetaTable {
 
@@ -69,6 +90,7 @@ struct RGWTable : EmptyMetaTable {
     std::ignore = table_name_upvalue(L);
     const auto map = reinterpret_cast<BackgroundMap*>(lua_touserdata(L, lua_upvalueindex(SECOND_UPVAL)));
     auto& mtx = *reinterpret_cast<std::shared_mutex*>(lua_touserdata(L, lua_upvalueindex(THIRD_UPVAL)));
+    const auto snapshots = reinterpret_cast<BackgroundKeySnapshotCache*>(lua_touserdata(L, lua_upvalueindex(FOURTH_UPVAL)));
     const auto index = luaL_checkstring(L, 2);
     
     if (strcasecmp(index, INCREMENT) == 0 || strcasecmp(index, DECREMENT) == 0) {
@@ -84,7 +106,9 @@ struct RGWTable : EmptyMetaTable {
         // erase the element. since in lua: "t[index] = nil" is removing the entry at "t[index]"
         {
           std::shared_lock l(mtx);
-          map->erase(index);
+          if (map->erase(index)) {
+            snapshots->key_set_changed();
+          }
         }
         return NO_RETURNVAL;
       case LUA_TBOOLEAN:
@@ -118,7 +142,9 @@ struct RGWTable : EmptyMetaTable {
     } else {
       std::shared_lock l(mtx);
       BackgroundMap::accessor accessor;
-      map->insert(accessor, std::string(index));
+      if (map->insert(accessor, std::string(index))) {
+        snapshots->key_set_changed();
+      }
       accessor->second = value;
     }
 
@@ -144,6 +170,7 @@ private:
   CephContext* const cct;
   std::thread runner;
   std::shared_mutex table_mutex;
+  BackgroundKeySnapshotCache key_snapshots;
   std::mutex cond_mutex;
   std::mutex pause_mutex;
   std::condition_variable cond;
@@ -171,12 +198,15 @@ private:
   void shutdown();
   void create_background_metatable(lua_State* L);
   BackgroundMapValue get_table_value(const std::string& key) const;
+  std::shared_ptr<const BackgroundKeySnapshot> get_key_snapshot();
 
   template<typename T>
   void put_table_value(const std::string& key, T value) {
     std::shared_lock l(table_mutex);
     BackgroundMap::accessor accessor;
-    rgw_map.insert(accessor, key);
+    if (rgw_map.insert(accessor, key)) {
+      key_snapshots.key_set_changed();
+    }
     accessor->second = value;
   }
 

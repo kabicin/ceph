@@ -8,6 +8,7 @@
 #include "rgw_sal_config.h"
 #include "rgw_perf_counters.h"
 #include "rgw_tag.h"
+#include "include/scope_guard.h"
 
 using namespace std;
 using namespace rgw;
@@ -1732,6 +1733,70 @@ TEST(TestRGWLuaBackground, KeySnapshotConcurrentWriters)
     t.join();
   }
   EXPECT_EQ(lua_background.get_key_snapshot()->keys.size(), writers * keys_per_writer);
+}
+
+TEST(TestRGWLuaBackground, KeySnapshotMemoryCapRejectsIteration)
+{
+  DEFINE_REQ_STATE;
+  TestBackground lua_background(pe.lua.manager.get());
+  pe.lua.background = &lua_background;
+  const auto cap = g_ceph_context->_conf->rgw_lua_max_table_snapshot_memory;
+  auto restore = make_scope_guard([cap] {
+    g_ceph_context->_conf->rgw_lua_max_table_snapshot_memory = cap;
+  });
+  g_ceph_context->_conf->rgw_lua_max_table_snapshot_memory = 1;
+
+  ASSERT_EQ(lua::request::execute(nullptr, nullptr, &s, nullptr, "RGW['a'] = 1"), 0);
+  EXPECT_EQ(lua_background.get_key_snapshot(), nullptr);
+  EXPECT_NE(lua::request::execute(nullptr, nullptr, &s, nullptr, "for k, v in pairs(RGW) do end"), 0);
+}
+
+TEST(TestRGWLuaBackground, KeySnapshotMemoryCapCountsPinnedSnapshots)
+{
+  auto manager = std::make_unique<TestLuaManager>();
+  TestBackground lua_background(manager.get());
+  const auto cap = g_ceph_context->_conf->rgw_lua_max_table_snapshot_memory;
+  auto restore = make_scope_guard([cap] {
+    g_ceph_context->_conf->rgw_lua_max_table_snapshot_memory = cap;
+  });
+
+  for (int i = 0; i < 4; ++i) {
+    lua_background.put_table_value(fmt::format("k{}", i), static_cast<long long int>(i));
+  }
+  const auto first_bytes = 4 * (sizeof(std::string) + 2);
+  const auto second_bytes = 5 * (sizeof(std::string) + 2);
+  g_ceph_context->_conf->rgw_lua_max_table_snapshot_memory = second_bytes + first_bytes / 2;
+
+  auto first = lua_background.get_key_snapshot();
+  ASSERT_NE(first, nullptr);
+
+  lua_background.put_table_value("k4", 4LL);
+  EXPECT_EQ(lua_background.get_key_snapshot(), nullptr);
+
+  first.reset();
+  const auto second = lua_background.get_key_snapshot();
+  ASSERT_NE(second, nullptr);
+  EXPECT_EQ(second->keys.size(), 5);
+}
+
+TEST(TestRGWLuaBackground, KeySnapshotMemoryCapZeroIsUnlimited)
+{
+  DEFINE_REQ_STATE;
+  TestBackground lua_background(pe.lua.manager.get());
+  pe.lua.background = &lua_background;
+  const auto cap = g_ceph_context->_conf->rgw_lua_max_table_snapshot_memory;
+  auto restore = make_scope_guard([cap] {
+    g_ceph_context->_conf->rgw_lua_max_table_snapshot_memory = cap;
+  });
+  g_ceph_context->_conf->rgw_lua_max_table_snapshot_memory = 0;
+
+  const std::string request_script = R"(
+    for i = 1, 100 do RGW["key" .. i] = i end
+    local n = 0
+    for _ in pairs(RGW) do n = n + 1 end
+    assert(n == 100)
+  )";
+  ASSERT_EQ(lua::request::execute(nullptr, nullptr, &s, nullptr, request_script), 0);
 }
 
 TEST(TestRGWLua, TracingSetAttribute)

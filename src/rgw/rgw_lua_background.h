@@ -26,14 +26,19 @@ using BackgroundMap = tbb::concurrent_hash_map<std::string, BackgroundMapValue>;
 struct BackgroundKeySnapshot {
   std::vector<std::string> keys;
   uint64_t generation = 0;
+  size_t bytes = 0;
 };
 
 class BackgroundKeySnapshotCache {
+  CephContext* const cct;
   std::atomic<uint64_t> generation{0};
+  std::shared_ptr<std::atomic<size_t>> live_bytes = std::make_shared<std::atomic<size_t>>(0);
   std::mutex mtx;
   std::shared_ptr<const BackgroundKeySnapshot> current;
 
 public:
+  explicit BackgroundKeySnapshotCache(CephContext* _cct) : cct(_cct) {}
+
   void key_set_changed() {
     generation.fetch_add(1, std::memory_order_release);
   }

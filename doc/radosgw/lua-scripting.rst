@@ -381,6 +381,9 @@ during execution so that it may be read and used later during other executions, 
 - Each RGW instance has its own private and ephemeral ``RGW`` Lua table that is lost when the daemon restarts. Note that ``background`` context scripts will run on every instance.
 - The maximum number of entries in the table is 100,000. Each entry has a string key a value with a combined length of no more than 1KB.
   A Lua script will abort with an error if the number of entries or entry size exceeds these limits.
+- Iterating over the table with ``pairs()`` uses a snapshot of its keys, shared by all scripts until a key is added or removed.
+  The memory used by all snapshots alive at the same time is limited to 256MB by default. A Lua script will abort with an error
+  if iterating would exceed this limit. To change it, use the ``rgw_lua_max_table_snapshot_memory`` configuration parameter. To disable the limit, use zero.
 - The ``RGW`` Lua table uses string indices and can store values of type: string, integer, double and boolean
 
 Increment/Decrement Functions

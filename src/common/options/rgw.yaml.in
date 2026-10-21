@@ -4815,6 +4815,19 @@ options:
   services:
   - rgw
   with_legacy: true
+- name: rgw_lua_max_table_snapshot_memory
+  type: uint
+  level: advanced
+  desc: Max size of memory used by all key snapshots of the Lua RGW table
+  long_desc: Iterating over the RGW table with pairs() uses a snapshot of its keys, which is
+    shared by all iterations until a key is added or removed. This is the maximum size in bytes
+    of all snapshots alive at the same time, across all Lua states. When a new snapshot would
+    exceed it, pairs() fails with an error. If set to zero, the amount of memory would only be
+    limited by the system.
+  default: 268435456
+  services:
+  - rgw
+  with_legacy: true
 - name: rgw_topic_require_publish_policy
   type: bool
   level: basic

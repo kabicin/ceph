@@ -5,6 +5,7 @@
 #include "rgw_perf_counters.h"
 #include "include/ceph_assert.h"
 #include <lua.hpp>
+#include <limits>
 
 #define dout_subsys ceph_subsys_rgw
 
@@ -16,16 +17,36 @@ std::shared_ptr<const BackgroundKeySnapshot> BackgroundKeySnapshotCache::get(
   if (current && current->generation == generation.load(std::memory_order_acquire)) {
     return current;
   }
-  auto snapshot = std::make_shared<BackgroundKeySnapshot>();
+  const uint64_t max_bytes = cct->_conf->rgw_lua_max_table_snapshot_memory;
+  size_t budget = std::numeric_limits<size_t>::max();
+  if (max_bytes > 0) {
+    const size_t reclaimable = (current && current.use_count() == 1) ? current->bytes : 0;
+    const size_t in_use = live_bytes->load() - reclaimable;
+    budget = max_bytes > in_use ? max_bytes - in_use : 0;
+  }
+  auto snapshot = std::make_unique<BackgroundKeySnapshot>();
   {
     std::unique_lock tl(table_mutex);
     snapshot->generation = generation.load(std::memory_order_acquire);
+    snapshot->bytes = map.size() * sizeof(std::string);
+    if (snapshot->bytes > budget) {
+      return nullptr;
+    }
     snapshot->keys.reserve(map.size());
     for (const auto& [k, v] : map) {
+      snapshot->bytes += k.size();
+      if (snapshot->bytes > budget) {
+        return nullptr;
+      }
       snapshot->keys.push_back(k);
     }
   }
-  current = std::move(snapshot);
+  live_bytes->fetch_add(snapshot->bytes);
+  current = std::shared_ptr<const BackgroundKeySnapshot>(snapshot.release(),
+      [live = live_bytes](const BackgroundKeySnapshot* s) {
+        live->fetch_sub(s->bytes);
+        delete s;
+      });
   return current;
 }
 
@@ -50,6 +71,9 @@ int RGWTable::PairsClosure(lua_State *L) {
   lua_setmetatable(L, -2);
 
   iterator->snapshot = snapshots->get(*map, mtx);
+  if (!iterator->snapshot) {
+    return luaL_error(L, "Lua RGW table snapshot memory limit exceeded");
+  }
 
   lua_pushlightuserdata(L, map);
   lua_pushcclosure(L, snapshot_next, ONE_UPVAL);
@@ -140,6 +164,7 @@ Background::Background(
     , dp(_cct, dout_subsys, "lua background: ")
     , lua_manager(_lua_manager)
     , cct(_cct)
+    , key_snapshots(_cct)
 {}
 
 void Background::shutdown(){

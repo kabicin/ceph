@@ -5,62 +5,21 @@
 #include "rgw_perf_counters.h"
 #include "include/ceph_assert.h"
 #include <lua.hpp>
-#include <limits>
+#include <optional>
 
 #define dout_subsys ceph_subsys_rgw
 
 namespace rgw::lua {
 
-std::shared_ptr<const BackgroundKeySnapshot> BackgroundKeySnapshotCache::get(
-    const BackgroundMap& map, std::shared_mutex& table_mutex) {
-  std::lock_guard l(mtx);
-  if (current && current->generation == generation.load(std::memory_order_acquire)) {
-    return current;
-  }
-  const uint64_t max_bytes = cct->_conf->rgw_lua_max_table_snapshot_memory;
-  size_t budget = std::numeric_limits<size_t>::max();
-  if (max_bytes > 0) {
-    const size_t reclaimable = (current && current.use_count() == 1) ? current->bytes : 0;
-    const size_t in_use = live_bytes->load() - reclaimable;
-    budget = max_bytes > in_use ? max_bytes - in_use : 0;
-  }
-  auto snapshot = std::make_unique<BackgroundKeySnapshot>();
-  {
-    std::unique_lock tl(table_mutex);
-    snapshot->generation = generation.load(std::memory_order_acquire);
-    snapshot->bytes = map.size() * sizeof(std::string);
-    if (snapshot->bytes > budget) {
-      return nullptr;
-    }
-    snapshot->keys.reserve(map.size());
-    for (const auto& [k, v] : map) {
-      snapshot->bytes += k.size();
-      if (snapshot->bytes > budget) {
-        return nullptr;
-      }
-      snapshot->keys.push_back(k);
-    }
-  }
-  live_bytes->fetch_add(snapshot->bytes);
-  current = std::shared_ptr<const BackgroundKeySnapshot>(snapshot.release(),
-      [live = live_bytes](const BackgroundKeySnapshot* s) {
-        live->fetch_sub(s->bytes);
-        delete s;
-      });
-  return current;
-}
-
 struct RGWTableIterator {
-  std::shared_ptr<const BackgroundKeySnapshot> snapshot;
-  size_t pos = 0;
+  std::string current_key;
+  std::optional<std::string> next_key;
 };
 
 int RGWTable::PairsClosure(lua_State *L) {
   std::ignore = table_name_upvalue(L);
   auto map = reinterpret_cast<BackgroundMap*>(lua_touserdata(L, lua_upvalueindex(SECOND_UPVAL)));
-  auto& mtx = *reinterpret_cast<std::shared_mutex*>(lua_touserdata(L, lua_upvalueindex(THIRD_UPVAL)));
-  auto snapshots = reinterpret_cast<BackgroundKeySnapshotCache*>(lua_touserdata(L, lua_upvalueindex(FOURTH_UPVAL)));
-  auto iterator = new (lua_newuserdata(L, sizeof(RGWTableIterator))) RGWTableIterator{};
+  auto mtx = reinterpret_cast<RWLock*>(lua_touserdata(L, lua_upvalueindex(THIRD_UPVAL)));
   if(luaL_newmetatable(L, "RGW.Iterator")) {
     lua_pushcfunction(L, [](lua_State* L) {
       static_cast<RGWTableIterator*>(lua_touserdata(L, 1))->~RGWTableIterator();
@@ -68,41 +27,56 @@ int RGWTable::PairsClosure(lua_State *L) {
     });
     lua_setfield(L, -2, "__gc");
   }
+  auto iterator = new (lua_newuserdata(L, sizeof(RGWTableIterator))) RGWTableIterator{};
+  lua_insert(L, -2);
   lua_setmetatable(L, -2);
 
-  iterator->snapshot = snapshots->get(*map, mtx);
-  if (!iterator->snapshot) {
-    return luaL_error(L, "Lua RGW table snapshot memory limit exceeded");
+  {
+    std::unique_lock l(*mtx);
+    if (auto it = map->begin(); it != map->end()) {
+      iterator->next_key = it->first;
+    }
   }
 
   lua_pushlightuserdata(L, map);
-  lua_pushcclosure(L, snapshot_next, ONE_UPVAL);
+  lua_pushlightuserdata(L, mtx);
+  lua_pushcclosure(L, iterator_next, TWO_UPVALS);
   lua_insert(L, -2);
   lua_pushnil(L);
   return THREE_RETURNVALS;
 }
 
-int RGWTable::snapshot_next(lua_State* L) {
+int RGWTable::iterator_next(lua_State* L) {
   auto map = reinterpret_cast<BackgroundMap*>(lua_touserdata(L, lua_upvalueindex(FIRST_UPVAL)));
+  auto& mtx = *reinterpret_cast<RWLock*>(lua_touserdata(L, lua_upvalueindex(SECOND_UPVAL)));
   auto iterator = static_cast<RGWTableIterator*>(luaL_checkudata(L, 1, "RGW.Iterator"));
 
-  while (iterator->snapshot && iterator->pos < iterator->snapshot->keys.size()) {
-    const auto& key = iterator->snapshot->keys[iterator->pos++];
-    BackgroundMapValue value;
-    {
-      BackgroundMap::const_accessor a;
-      if (!map->find(a, key)) {
-        continue;
-      }
-      value = a->second;
-    }
-    pushstring(L, key);
-    std::visit([L](auto&& v) { pushvalue(L, v); }, value);
-    return TWO_RETURNVALS;
+  if (!iterator->next_key) {
+    lua_pushnil(L);
+    return ONE_RETURNVAL;
   }
-  iterator->snapshot.reset();
-  lua_pushnil(L);
-  return ONE_RETURNVAL;
+
+  BackgroundMapValue value;
+  {
+    std::unique_lock l(mtx);
+    auto [it, last] = map->equal_range(*iterator->next_key);
+    if (it == last) {
+      iterator->next_key.reset();
+      lua_pushnil(L);
+      lua_pushnil(L);
+      return TWO_RETURNVALS;
+    }
+    iterator->current_key = std::move(*iterator->next_key);
+    value = it->second;
+    if (++it != map->end()) {
+      iterator->next_key = it->first;
+    } else {
+      iterator->next_key.reset();
+    }
+  }
+  pushstring(L, iterator->current_key);
+  std::visit([L](auto&& v) { pushvalue(L, v); }, value);
+  return TWO_RETURNVALS;
 }
 
 const char* RGWTable::INCREMENT = "increment";
@@ -110,7 +84,8 @@ const char* RGWTable::DECREMENT = "decrement";
 
 int RGWTable::increment_by(lua_State* L) {
   const auto map = reinterpret_cast<BackgroundMap*>(lua_touserdata(L, lua_upvalueindex(FIRST_UPVAL)));
-  auto decrement = lua_toboolean(L, lua_upvalueindex(SECOND_UPVAL));
+  auto& mtx = *reinterpret_cast<RWLock*>(lua_touserdata(L, lua_upvalueindex(SECOND_UPVAL)));
+  auto decrement = lua_toboolean(L, lua_upvalueindex(THIRD_UPVAL));
 
   const auto args = lua_gettop(L);
   const auto index = luaL_checkstring(L, 1);
@@ -128,6 +103,7 @@ int RGWTable::increment_by(lua_State* L) {
     }
   }
 
+  std::shared_lock l(mtx);
   BackgroundMap::accessor accessor;
   if (map->find(accessor, std::string(index))) {
     auto& value = accessor->second;
@@ -141,6 +117,7 @@ int RGWTable::increment_by(lua_State* L) {
       value = static_cast<double>(std::get<long long int>(value)) + std::get<double>(inc_by);
     } else {
       accessor.release();
+      l.unlock();
       return luaL_error(L, "can increment only numeric values");
     }
   }
@@ -164,7 +141,6 @@ Background::Background(
     , dp(_cct, dout_subsys, "lua background: ")
     , lua_manager(_lua_manager)
     , cct(_cct)
-    , key_snapshots(_cct)
 {}
 
 void Background::shutdown(){
@@ -234,11 +210,8 @@ std::unique_ptr<lua_state_guard> Background::initialize_lguard_state() {
 
 const BackgroundMapValue Background::empty_table_value;
 
-std::shared_ptr<const BackgroundKeySnapshot> Background::get_key_snapshot() {
-  return key_snapshots.get(rgw_map, table_mutex);
-}
-
 BackgroundMapValue Background::get_table_value(const std::string& key) const {
+  std::shared_lock l(table_mutex);
   BackgroundMap::const_accessor accessor;
   if (rgw_map.find(accessor, key)) {
       return accessor->second;
@@ -300,7 +273,7 @@ void Background::run() {
 
 void Background::create_background_metatable(lua_State* L) {
   static const char* background_table_name = "RGW";
-  create_metatable<RGWTable>(L, "", background_table_name, true, &rgw_map, &table_mutex, &key_snapshots);
+  create_metatable<RGWTable>(L, "", background_table_name, true, &rgw_map, &table_mutex);
   lua_getglobal(L, background_table_name);
   ceph_assert(lua_istable(L, -1));
 }

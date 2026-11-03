@@ -358,7 +358,6 @@ typename MapType::iterator* create_iterator_metadata(lua_State* L, const std::st
       auto map = reinterpret_cast<MapType*>(lua_touserdata(L, lua_upvalueindex(SECOND_UPVAL)));
       ceph_assert(iter);
       if (*iter == map->end()) {
-        // iterator is past-the-end; return "nil" to match Lua's tostring(nil) behavior
         lua_pushliteral(L, "nil");
         return ONE_RETURNVAL;
       }

@@ -8,7 +8,6 @@
 #include "rgw_sal_config.h"
 #include "rgw_perf_counters.h"
 #include "rgw_tag.h"
-#include "include/scope_guard.h"
 
 using namespace std;
 using namespace rgw;
@@ -1319,27 +1318,60 @@ TEST(TestRGWLuaBackground, TableIterateWriteFutureElement)
     RGW["c"] = 3
     RGW["d"] = 4
     RGW["e"] = 5
-    local total = #RGW
+    local order = {}
+    for k, v in pairs(RGW) do
+      table.insert(order, k)
+    end
+    local total = #order
+    -- erase the key after the next one, so the iteration can still advance
+    local erased_key = order[3]
     local counter = 0
-    local erased_key
     local seen = {}
     for k, v in pairs(RGW) do
       counter = counter + 1
       seen[k] = true
       if counter == 1 then
-        -- on the first step every other key is still ahead of the iteration
-        for _, key in ipairs({"a", "b", "c", "d", "e"}) do
-          if key ~= k then
-            erased_key = key
-            break
-          end
-        end
         RGW[erased_key] = nil
         print("future element '" .. erased_key .. "' is deleted")
       end
     end
     assert(counter == total - 1)
     assert(not seen[erased_key])
+    assert(RGW[erased_key] == nil)
+  )";
+
+  pe.lua.background = &lua_background;
+
+  const auto rc = lua::request::execute(nullptr, nullptr, &s, nullptr, request_script);
+  ASSERT_EQ(rc, 0);
+}
+
+TEST(TestRGWLuaBackground, TableIterateWriteNextElement)
+{
+  DEFINE_REQ_STATE;
+  TestBackground lua_background(pe.lua.manager.get());
+
+  const std::string request_script = R"(
+    RGW["a"] = 1
+    RGW["b"] = 2
+    RGW["c"] = 3
+    RGW["d"] = 4
+    RGW["e"] = 5
+    local order = {}
+    for k, v in pairs(RGW) do
+      table.insert(order, k)
+    end
+    local erased_key = order[2]
+    local counter = 0
+    for k, v in pairs(RGW) do
+      counter = counter + 1
+      if counter == 1 then
+        RGW[erased_key] = nil
+        print("next element '" .. erased_key .. "' is deleted")
+      end
+    end
+    -- the iteration loses its position when the next key is erased
+    assert(counter == 1)
     assert(RGW[erased_key] == nil)
   )";
 
@@ -1633,170 +1665,104 @@ TEST(TestRGWLuaBackground, TableIterateStepByStep)
   lua_background.shutdown();
 }
 
-TEST(TestRGWLuaBackground, KeySnapshotSharedWhileKeysUnchanged)
+int execute_concurrently(const RGWProcessEnv& pe, const std::vector<std::string>& scripts)
 {
-  DEFINE_REQ_STATE;
-  TestBackground lua_background(pe.lua.manager.get());
-  pe.lua.background = &lua_background;
-
-  ASSERT_EQ(lua::request::execute(nullptr, nullptr, &s, nullptr, "RGW['a'] = 1; RGW['b'] = 2"), 0);
-  const auto first = lua_background.get_key_snapshot();
-  ASSERT_EQ(first->keys.size(), 2);
-
-  ASSERT_EQ(lua::request::execute(nullptr, nullptr, &s, nullptr,
-        "RGW['a'] = 10; RGW.increment('b'); RGW['missing'] = nil"), 0);
-  lua_background.put_table_value("a", 7LL);
-  EXPECT_EQ(lua_background.get_key_snapshot(), first);
-}
-
-TEST(TestRGWLuaBackground, KeySnapshotRebuiltOnNewKey)
-{
-  DEFINE_REQ_STATE;
-  TestBackground lua_background(pe.lua.manager.get());
-  pe.lua.background = &lua_background;
-
-  ASSERT_EQ(lua::request::execute(nullptr, nullptr, &s, nullptr, "RGW['a'] = 1"), 0);
-  const auto first = lua_background.get_key_snapshot();
-
-  ASSERT_EQ(lua::request::execute(nullptr, nullptr, &s, nullptr, "RGW['b'] = 2"), 0);
-  const auto second = lua_background.get_key_snapshot();
-  EXPECT_NE(second, first);
-  EXPECT_EQ(second->keys.size(), 2);
-
-  lua_background.put_table_value("c", 3LL);
-  const auto third = lua_background.get_key_snapshot();
-  EXPECT_NE(third, second);
-  EXPECT_EQ(third->keys.size(), 3);
-}
-
-TEST(TestRGWLuaBackground, KeySnapshotRebuiltOnErase)
-{
-  DEFINE_REQ_STATE;
-  TestBackground lua_background(pe.lua.manager.get());
-  pe.lua.background = &lua_background;
-
-  ASSERT_EQ(lua::request::execute(nullptr, nullptr, &s, nullptr, "RGW['a'] = 1; RGW['b'] = 2"), 0);
-  const auto first = lua_background.get_key_snapshot();
-
-  ASSERT_EQ(lua::request::execute(nullptr, nullptr, &s, nullptr, "RGW['a'] = nil"), 0);
-  const auto second = lua_background.get_key_snapshot();
-  EXPECT_NE(second, first);
-  ASSERT_EQ(second->keys.size(), 1);
-  EXPECT_EQ(second->keys[0], "b");
-}
-
-TEST(TestRGWLuaBackground, TableIteratePairsSeesOwnWrites)
-{
-  DEFINE_REQ_STATE;
-  TestBackground lua_background(pe.lua.manager.get());
-  pe.lua.background = &lua_background;
-
-  const std::string request_script = R"(
-    local function count()
-      local n = 0
-      for _ in pairs(RGW) do n = n + 1 end
-      return n
-    end
-    RGW["a"] = 1
-    assert(count() == 1)
-    RGW["b"] = 2
-    assert(count() == 2)
-    RGW["a"] = nil
-    assert(count() == 1)
-  )";
-
-  const auto rc = lua::request::execute(nullptr, nullptr, &s, nullptr, request_script);
-  ASSERT_EQ(rc, 0);
-}
-
-TEST(TestRGWLuaBackground, KeySnapshotConcurrentWriters)
-{
-  auto manager = std::make_unique<TestLuaManager>();
-  TestBackground lua_background(manager.get());
-
-  constexpr int writers = 4;
-  constexpr int keys_per_writer = 500;
+  std::atomic<int> failures = 0;
   std::vector<std::thread> threads;
-  for (int w = 0; w < writers; ++w) {
-    threads.emplace_back([&lua_background, w] {
-      for (int i = 0; i < keys_per_writer; ++i) {
-        lua_background.put_table_value(fmt::format("w{}-k{}", w, i), static_cast<long long int>(i));
+  for (const auto& script : scripts) {
+    threads.emplace_back([&pe, &script, &failures] {
+      RGWEnv e;
+      req_state s(g_ceph_context, pe, &e, 0);
+      if (lua::request::execute(nullptr, nullptr, &s, nullptr, script) != 0) {
+        ++failures;
       }
     });
-  }
-  for (int i = 0; i < 200; ++i) {
-    const auto snapshot = lua_background.get_key_snapshot();
-    std::set<std::string> unique(snapshot->keys.begin(), snapshot->keys.end());
-    EXPECT_EQ(unique.size(), snapshot->keys.size());
   }
   for (auto& t : threads) {
     t.join();
   }
-  EXPECT_EQ(lua_background.get_key_snapshot()->keys.size(), writers * keys_per_writer);
+  return failures;
 }
 
-TEST(TestRGWLuaBackground, KeySnapshotMemoryCapRejectsIteration)
+TEST(TestRGWLuaBackground, TableConcurrentAccess)
 {
-  DEFINE_REQ_STATE;
+  RGWProcessEnv pe;
+  pe.lua.manager = std::make_unique<TestLuaManager>();
   TestBackground lua_background(pe.lua.manager.get());
   pe.lua.background = &lua_background;
-  const auto cap = g_ceph_context->_conf->rgw_lua_max_table_snapshot_memory;
-  auto restore = make_scope_guard([cap] {
-    g_ceph_context->_conf->rgw_lua_max_table_snapshot_memory = cap;
-  });
-  g_ceph_context->_conf->rgw_lua_max_table_snapshot_memory = 1;
 
-  ASSERT_EQ(lua::request::execute(nullptr, nullptr, &s, nullptr, "RGW['a'] = 1"), 0);
-  EXPECT_EQ(lua_background.get_key_snapshot(), nullptr);
-  EXPECT_NE(lua::request::execute(nullptr, nullptr, &s, nullptr, "for k, v in pairs(RGW) do end"), 0);
-}
-
-TEST(TestRGWLuaBackground, KeySnapshotMemoryCapCountsPinnedSnapshots)
-{
-  auto manager = std::make_unique<TestLuaManager>();
-  TestBackground lua_background(manager.get());
-  const auto cap = g_ceph_context->_conf->rgw_lua_max_table_snapshot_memory;
-  auto restore = make_scope_guard([cap] {
-    g_ceph_context->_conf->rgw_lua_max_table_snapshot_memory = cap;
-  });
-
-  for (int i = 0; i < 4; ++i) {
-    lua_background.put_table_value(fmt::format("k{}", i), static_cast<long long int>(i));
+  constexpr int counters = 8;
+  constexpr int strings = 200;
+  constexpr int ops = 2000;
+  for (int i = 1; i <= counters; ++i) {
+    lua_background.put_table_value(fmt::format("c{}", i), 0LL);
   }
-  const auto first_bytes = 4 * (sizeof(std::string) + 2);
-  const auto second_bytes = 5 * (sizeof(std::string) + 2);
-  g_ceph_context->_conf->rgw_lua_max_table_snapshot_memory = second_bytes + first_bytes / 2;
+  for (int i = 1; i <= strings; ++i) {
+    lua_background.put_table_value(fmt::format("s{}", i), fmt::format("value{}", i));
+  }
 
-  auto first = lua_background.get_key_snapshot();
-  ASSERT_NE(first, nullptr);
+  const auto increment_script = fmt::format(R"(
+    for i = 1, {} do RGW.increment("c" .. (i % {} + 1)) end
+  )", ops, counters);
+  const auto read_script = fmt::format(R"(
+    for i = 1, {} do assert(type(RGW["s" .. (i % {} + 1)]) == "string") end
+  )", ops, strings);
+  const auto grow_script = [ops](int id) {
+    return fmt::format(R"(
+      for i = 1, {} do RGW["g{}-" .. i] = i end
+    )", ops, id);
+  };
+  const auto churn_script = fmt::format(R"(
+    for i = 1, {} do RGW["t"] = i; RGW["t"] = nil end
+  )", ops);
+  const std::string iterate_script = R"(
+    for round = 1, 5 do
+      for k, v in pairs(RGW) do
+        assert(type(k) == "string")
+        assert(type(v) == "number" or type(v) == "string")
+      end
+    end
+  )";
 
-  lua_background.put_table_value("k4", 4LL);
-  EXPECT_EQ(lua_background.get_key_snapshot(), nullptr);
+  const std::vector<std::string> scripts = {
+    increment_script, increment_script,
+    read_script, read_script,
+    grow_script(1), grow_script(2),
+    churn_script,
+    iterate_script, iterate_script,
+  };
+  EXPECT_EQ(execute_concurrently(pe, scripts), 0);
 
-  first.reset();
-  const auto second = lua_background.get_key_snapshot();
-  ASSERT_NE(second, nullptr);
-  EXPECT_EQ(second->keys.size(), 5);
+  long long int total = 0;
+  for (int i = 1; i <= counters; ++i) {
+    total += get_table_value<long long int>(lua_background, fmt::format("c{}", i));
+  }
+  EXPECT_EQ(total, 2 * ops);
 }
 
-TEST(TestRGWLuaBackground, KeySnapshotMemoryCapZeroIsUnlimited)
+TEST(TestRGWLuaBackground, TableEntryLimitConcurrentWriters)
 {
-  DEFINE_REQ_STATE;
+  RGWProcessEnv pe;
+  pe.lua.manager = std::make_unique<TestLuaManager>();
   TestBackground lua_background(pe.lua.manager.get());
   pe.lua.background = &lua_background;
-  const auto cap = g_ceph_context->_conf->rgw_lua_max_table_snapshot_memory;
-  auto restore = make_scope_guard([cap] {
-    g_ceph_context->_conf->rgw_lua_max_table_snapshot_memory = cap;
-  });
-  g_ceph_context->_conf->rgw_lua_max_table_snapshot_memory = 0;
 
-  const std::string request_script = R"(
-    for i = 1, 100 do RGW["key" .. i] = i end
-    local n = 0
-    for _ in pairs(RGW) do n = n + 1 end
-    assert(n == 100)
-  )";
-  ASSERT_EQ(lua::request::execute(nullptr, nullptr, &s, nullptr, request_script), 0);
+  constexpr int writers = 4;
+  constexpr int keys_per_writer = lua::MAX_LUA_KEY_ENTRIES / writers + 5000;
+  std::vector<std::string> scripts;
+  for (int w = 0; w < writers; ++w) {
+    scripts.push_back(fmt::format(R"(
+      for i = 1, {} do pcall(function() RGW["w{}-" .. i] = i end) end
+    )", keys_per_writer, w));
+  }
+  EXPECT_EQ(execute_concurrently(pe, scripts), 0);
+
+  const auto check_script = fmt::format(R"(
+    local n = #RGW
+    assert(n <= {} + 1, "table holds " .. n .. " entries")
+    assert(n >= {} - {}, "table holds " .. n .. " entries")
+  )", lua::MAX_LUA_KEY_ENTRIES, lua::MAX_LUA_KEY_ENTRIES, writers);
+  EXPECT_EQ(execute_concurrently(pe, {check_script}), 0);
 }
 
 TEST(TestRGWLua, TracingSetAttribute)

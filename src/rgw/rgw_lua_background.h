@@ -1,11 +1,9 @@
 #pragma once
 #include "common/dout.h"
+#include "common/RWLock.h"
 #include "rgw_common.h"
-#include <atomic>
-#include <memory>
 #include <string>
 #include <set>
-#include <vector>
 #include <variant>
 #include <shared_mutex>
 #include <mutex>
@@ -23,29 +21,6 @@ constexpr const int INIT_EXECUTE_INTERVAL = 5;
 using BackgroundMapValue = std::variant<std::string, long long int, double, bool>;
 using BackgroundMap = tbb::concurrent_hash_map<std::string, BackgroundMapValue>;
 
-struct BackgroundKeySnapshot {
-  std::vector<std::string> keys;
-  uint64_t generation = 0;
-  size_t bytes = 0;
-};
-
-class BackgroundKeySnapshotCache {
-  CephContext* const cct;
-  std::atomic<uint64_t> generation{0};
-  std::shared_ptr<std::atomic<size_t>> live_bytes = std::make_shared<std::atomic<size_t>>(0);
-  std::mutex mtx;
-  std::shared_ptr<const BackgroundKeySnapshot> current;
-
-public:
-  explicit BackgroundKeySnapshotCache(CephContext* _cct) : cct(_cct) {}
-
-  void key_set_changed() {
-    generation.fetch_add(1, std::memory_order_release);
-  }
-
-  std::shared_ptr<const BackgroundKeySnapshot> get(const BackgroundMap& map, std::shared_mutex& table_mutex);
-};
-
 struct RGWTable : EmptyMetaTable {
 
   static const char* INCREMENT;
@@ -56,29 +31,38 @@ struct RGWTable : EmptyMetaTable {
   static int IndexClosure(lua_State* L) {
     std::ignore = table_name_upvalue(L);
     const auto map = reinterpret_cast<BackgroundMap*>(lua_touserdata(L, lua_upvalueindex(SECOND_UPVAL)));
+    auto& mtx = *reinterpret_cast<RWLock*>(lua_touserdata(L, lua_upvalueindex(THIRD_UPVAL)));
     const char* index = luaL_checkstring(L, 2);
 
     if (strcasecmp(index, INCREMENT) == 0) {
       lua_pushlightuserdata(L, map);
+      lua_pushlightuserdata(L, &mtx);
       lua_pushboolean(L, false /*increment*/);
-      lua_pushcclosure(L, increment_by, TWO_UPVALS);
+      lua_pushcclosure(L, increment_by, THREE_UPVALS);
       return ONE_RETURNVAL;
-    } 
+    }
     if (strcasecmp(index, DECREMENT) == 0) {
       lua_pushlightuserdata(L, map);
+      lua_pushlightuserdata(L, &mtx);
       lua_pushboolean(L, true /*decrement*/);
-      lua_pushcclosure(L, increment_by, TWO_UPVALS);
+      lua_pushcclosure(L, increment_by, THREE_UPVALS);
       return ONE_RETURNVAL;
     }
 
     BackgroundMapValue value;
-    BackgroundMap::const_accessor accessor;
-    if (!map->find(accessor, std::string(index))) {
+    bool found;
+    {
+      std::shared_lock l(mtx);
+      BackgroundMap::const_accessor accessor;
+      found = map->find(accessor, std::string(index));
+      if (found) {
+        value = accessor->second;
+      }
+    }
+    if (!found) {
       lua_pushnil(L);
       return ONE_RETURNVAL;
     }
-    value = accessor->second;
-    accessor.release();
     std::visit([L](auto&& value) { pushvalue(L, value); }, value);
     return ONE_RETURNVAL;
   }
@@ -94,8 +78,7 @@ struct RGWTable : EmptyMetaTable {
   static int NewIndexClosure(lua_State* L) {
     std::ignore = table_name_upvalue(L);
     const auto map = reinterpret_cast<BackgroundMap*>(lua_touserdata(L, lua_upvalueindex(SECOND_UPVAL)));
-    auto& mtx = *reinterpret_cast<std::shared_mutex*>(lua_touserdata(L, lua_upvalueindex(THIRD_UPVAL)));
-    const auto snapshots = reinterpret_cast<BackgroundKeySnapshotCache*>(lua_touserdata(L, lua_upvalueindex(FOURTH_UPVAL)));
+    auto& mtx = *reinterpret_cast<RWLock*>(lua_touserdata(L, lua_upvalueindex(THIRD_UPVAL)));
     const auto index = luaL_checkstring(L, 2);
     
     if (strcasecmp(index, INCREMENT) == 0 || strcasecmp(index, DECREMENT) == 0) {
@@ -111,9 +94,7 @@ struct RGWTable : EmptyMetaTable {
         // erase the element. since in lua: "t[index] = nil" is removing the entry at "t[index]"
         {
           std::shared_lock l(mtx);
-          if (map->erase(index)) {
-            snapshots->key_set_changed();
-          }
+          map->erase(index);
         }
         return NO_RETURNVAL;
       case LUA_TBOOLEAN:
@@ -147,8 +128,11 @@ struct RGWTable : EmptyMetaTable {
     } else {
       std::shared_lock l(mtx);
       BackgroundMap::accessor accessor;
-      if (map->insert(accessor, std::string(index))) {
-        snapshots->key_set_changed();
+      const bool inserted = map->insert(accessor, std::string(index));
+      if (inserted && map->size() > MAX_LUA_KEY_ENTRIES + 1) {
+        map->erase(accessor);
+        l.unlock();
+        return luaL_error(L, "Lua max number of entries limit exceeded");
       }
       accessor->second = value;
     }
@@ -157,7 +141,7 @@ struct RGWTable : EmptyMetaTable {
   }
 
   static int PairsClosure(lua_State* L);
-  static int snapshot_next(lua_State* L);
+  static int iterator_next(lua_State* L);
 };
 
 class Background : public RGWRealmReloader::Pauser {
@@ -174,8 +158,7 @@ private:
   rgw::sal::LuaManager* lua_manager; 
   CephContext* const cct;
   std::thread runner;
-  std::shared_mutex table_mutex;
-  BackgroundKeySnapshotCache key_snapshots;
+  mutable RWLock table_mutex{"rgw_lua_background_table", false, true, true};
   std::mutex cond_mutex;
   std::mutex pause_mutex;
   std::condition_variable cond;
@@ -203,15 +186,12 @@ private:
   void shutdown();
   void create_background_metatable(lua_State* L);
   BackgroundMapValue get_table_value(const std::string& key) const;
-  std::shared_ptr<const BackgroundKeySnapshot> get_key_snapshot();
 
   template<typename T>
   void put_table_value(const std::string& key, T value) {
     std::shared_lock l(table_mutex);
     BackgroundMap::accessor accessor;
-    if (rgw_map.insert(accessor, key)) {
-      key_snapshots.key_set_changed();
-    }
+    rgw_map.insert(accessor, key);
     accessor->second = value;
   }
 

@@ -1361,17 +1361,20 @@ TEST(TestRGWLuaBackground, TableIterateWriteNextElement)
     for k, v in pairs(RGW) do
       table.insert(order, k)
     end
+    local total = #order
     local erased_key = order[2]
     local counter = 0
+    local seen = {}
     for k, v in pairs(RGW) do
       counter = counter + 1
+      seen[k] = true
       if counter == 1 then
         RGW[erased_key] = nil
         print("next element '" .. erased_key .. "' is deleted")
       end
     end
-    -- the iteration loses its position when the next key is erased
-    assert(counter == 1)
+    assert(counter == total - 1)
+    assert(not seen[erased_key])
     assert(RGW[erased_key] == nil)
   )";
 

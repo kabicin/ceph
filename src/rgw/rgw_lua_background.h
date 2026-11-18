@@ -1,8 +1,12 @@
 #pragma once
 #include "common/dout.h"
-#include "common/RWLock.h"
 #include "rgw_common.h"
+#include <array>
+#include <atomic>
+#include <map>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <set>
 #include <variant>
 #include <shared_mutex>
@@ -10,16 +14,45 @@
 #include <boost/lockfree/queue.hpp>
 #include "rgw_lua_utils.h"
 #include "rgw_realm_reloader.h"
-#include <tbb/concurrent_hash_map.h>
+#include <tbb/spin_mutex.h>
+#include <tbb/spin_rw_mutex.h>
 
 namespace rgw::lua {
 
 //Interval between each execution of the script is set to 5 seconds
 constexpr const int INIT_EXECUTE_INTERVAL = 5;
 
-//Writeable meta table named RGW
+//Writeable meta table named RGW with mutex protection
 using BackgroundMapValue = std::variant<std::string, long long int, double, bool>;
-using BackgroundMap = tbb::concurrent_hash_map<std::string, BackgroundMapValue>;
+
+class BackgroundMap {
+public:
+  enum class SetResult { ok, too_many_entries };
+
+  std::optional<BackgroundMapValue> get(std::string_view key) const;
+  SetResult set(std::string_view key, BackgroundMapValue value);
+  void erase(std::string_view key);
+  bool increment(std::string_view key, const BackgroundMapValue& by);
+  size_t size() const { return entries.load(std::memory_order_relaxed); }
+  std::optional<std::pair<std::string, BackgroundMapValue>> next(
+      std::optional<std::string_view> previous) const;
+
+private:
+  struct Entry {
+    mutable tbb::spin_mutex mtx;
+    BackgroundMapValue value;
+  };
+  struct alignas(64) Shard {
+    mutable tbb::spin_rw_mutex mtx;
+    std::map<std::string, Entry, std::less<>> map;
+    std::atomic<size_t> count = 0;
+  };
+  static constexpr size_t SHARDS = 256;
+
+  static size_t shard_index(std::string_view key);
+  std::array<Shard, SHARDS> shards;
+  std::atomic<size_t> entries = 0;
+};
 
 struct RGWTable : EmptyMetaTable {
 
@@ -30,72 +63,49 @@ struct RGWTable : EmptyMetaTable {
 
   static int IndexClosure(lua_State* L) {
     std::ignore = table_name_upvalue(L);
-    const auto map = reinterpret_cast<BackgroundMap*>(lua_touserdata(L, lua_upvalueindex(SECOND_UPVAL)));
-    auto& mtx = *reinterpret_cast<RWLock*>(lua_touserdata(L, lua_upvalueindex(THIRD_UPVAL)));
-    const char* index = luaL_checkstring(L, 2);
+    auto map = reinterpret_cast<BackgroundMap*>(lua_touserdata(L, lua_upvalueindex(SECOND_UPVAL)));
+    size_t len;
+    const char* index = luaL_checklstring(L, 2, &len);
 
-    if (strcasecmp(index, INCREMENT) == 0) {
+    if (strcasecmp(index, INCREMENT) == 0 || strcasecmp(index, DECREMENT) == 0) {
       lua_pushlightuserdata(L, map);
-      lua_pushlightuserdata(L, &mtx);
-      lua_pushboolean(L, false /*increment*/);
-      lua_pushcclosure(L, increment_by, THREE_UPVALS);
-      return ONE_RETURNVAL;
-    }
-    if (strcasecmp(index, DECREMENT) == 0) {
-      lua_pushlightuserdata(L, map);
-      lua_pushlightuserdata(L, &mtx);
-      lua_pushboolean(L, true /*decrement*/);
-      lua_pushcclosure(L, increment_by, THREE_UPVALS);
+      lua_pushboolean(L, strcasecmp(index, DECREMENT) == 0);
+      lua_pushcclosure(L, increment_by, TWO_UPVALS);
       return ONE_RETURNVAL;
     }
 
-    BackgroundMapValue value;
-    bool found;
-    {
-      std::shared_lock l(mtx);
-      BackgroundMap::const_accessor accessor;
-      found = map->find(accessor, std::string(index));
-      if (found) {
-        value = accessor->second;
-      }
-    }
-    if (!found) {
+    const auto value = map->get({index, len});
+    if (!value) {
       lua_pushnil(L);
       return ONE_RETURNVAL;
     }
-    std::visit([L](auto&& value) { pushvalue(L, value); }, value);
+    std::visit([L](auto&& v) { pushvalue(L, v); }, *value);
     return ONE_RETURNVAL;
   }
 
   static int LenClosure(lua_State* L) {
-    const auto map = reinterpret_cast<BackgroundMap*>(lua_touserdata(L, lua_upvalueindex(FIRST_UPVAL)));
-
+    auto map = reinterpret_cast<BackgroundMap*>(lua_touserdata(L, lua_upvalueindex(FIRST_UPVAL)));
     lua_pushinteger(L, map->size());
-
     return ONE_RETURNVAL;
   }
 
   static int NewIndexClosure(lua_State* L) {
     std::ignore = table_name_upvalue(L);
-    const auto map = reinterpret_cast<BackgroundMap*>(lua_touserdata(L, lua_upvalueindex(SECOND_UPVAL)));
-    auto& mtx = *reinterpret_cast<RWLock*>(lua_touserdata(L, lua_upvalueindex(THIRD_UPVAL)));
-    const auto index = luaL_checkstring(L, 2);
-    
+    auto map = reinterpret_cast<BackgroundMap*>(lua_touserdata(L, lua_upvalueindex(SECOND_UPVAL)));
+    size_t key_len;
+    const char* index = luaL_checklstring(L, 2, &key_len);
+    const std::string_view key(index, key_len);
+
     if (strcasecmp(index, INCREMENT) == 0 || strcasecmp(index, DECREMENT) == 0) {
         return luaL_error(L, "increment/decrement are reserved function names for RGW");
     }
 
     size_t len;
     BackgroundMapValue value;
-    const int value_type = lua_type(L, 3);
-
-    switch (value_type) {
+    switch (lua_type(L, 3)) {
       case LUA_TNIL:
         // erase the element. since in lua: "t[index] = nil" is removing the entry at "t[index]"
-        {
-          std::shared_lock l(mtx);
-          map->erase(index);
-        }
+        map->erase(key);
         return NO_RETURNVAL;
       case LUA_TBOOLEAN:
         value = static_cast<bool>(lua_toboolean(L, 3));
@@ -120,23 +130,12 @@ struct RGWTable : EmptyMetaTable {
         return luaL_error(L, "unsupported value type for RGW table");
     }
 
-    if (len + strnlen(index, MAX_LUA_VALUE_SIZE)
-      > MAX_LUA_VALUE_SIZE) {
+    if (len + key_len > MAX_LUA_VALUE_SIZE) {
       return luaL_error(L, "Lua maximum size of entry limit exceeded");
-    } else if (map->size() > MAX_LUA_KEY_ENTRIES) {
-      return luaL_error(L, "Lua max number of entries limit exceeded");
-    } else {
-      std::shared_lock l(mtx);
-      BackgroundMap::accessor accessor;
-      const bool inserted = map->insert(accessor, std::string(index));
-      if (inserted && map->size() > MAX_LUA_KEY_ENTRIES + 1) {
-        map->erase(accessor);
-        l.unlock();
-        return luaL_error(L, "Lua max number of entries limit exceeded");
-      }
-      accessor->second = value;
     }
-
+    if (map->set(key, std::move(value)) == BackgroundMap::SetResult::too_many_entries) {
+      return luaL_error(L, "Lua max number of entries limit exceeded");
+    }
     return NO_RETURNVAL;
   }
 
@@ -158,7 +157,6 @@ private:
   rgw::sal::LuaManager* lua_manager; 
   CephContext* const cct;
   std::thread runner;
-  mutable RWLock table_mutex{"rgw_lua_background_table", false, true, true};
   std::mutex cond_mutex;
   std::mutex pause_mutex;
   std::condition_variable cond;
@@ -189,10 +187,7 @@ private:
 
   template<typename T>
   void put_table_value(const std::string& key, T value) {
-    std::shared_lock l(table_mutex);
-    BackgroundMap::accessor accessor;
-    rgw_map.insert(accessor, key);
-    accessor->second = value;
+    rgw_map.set(key, value);
   }
 
   // update the manager after 

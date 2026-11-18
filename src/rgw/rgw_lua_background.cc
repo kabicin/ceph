@@ -11,71 +11,132 @@
 
 namespace rgw::lua {
 
-struct RGWTableIterator {
-  std::string current_key;
-  std::optional<std::string> next_key;
-};
+size_t BackgroundMap::shard_index(std::string_view key) {
+  return (std::hash<std::string_view>{}(key) >> 8) % SHARDS;
+}
+
+std::optional<BackgroundMapValue> BackgroundMap::get(std::string_view key) const {
+  const auto& shard = shards[shard_index(key)];
+  std::shared_lock l(shard.mtx);
+  const auto it = shard.map.find(key);
+  if (it == shard.map.end()) {
+    return std::nullopt;
+  }
+  tbb::spin_mutex::scoped_lock entry_lock(it->second.mtx);
+  return it->second.value;
+}
+
+BackgroundMap::SetResult BackgroundMap::set(std::string_view key, BackgroundMapValue value) {
+  auto& shard = shards[shard_index(key)];
+  {
+    std::shared_lock l(shard.mtx);
+    if (auto it = shard.map.find(key); it != shard.map.end()) {
+      tbb::spin_mutex::scoped_lock entry_lock(it->second.mtx);
+      it->second.value = std::move(value);
+      return SetResult::ok;
+    }
+  }
+  std::unique_lock l(shard.mtx);
+  auto it = shard.map.find(key);
+  if (it == shard.map.end()) {
+    if (entries.fetch_add(1, std::memory_order_relaxed) > MAX_LUA_KEY_ENTRIES) {
+      entries.fetch_sub(1, std::memory_order_relaxed);
+      return SetResult::too_many_entries;
+    }
+    it = shard.map.try_emplace(std::string(key)).first;
+    shard.count.store(shard.map.size(), std::memory_order_relaxed);
+  }
+  it->second.value = std::move(value);
+  return SetResult::ok;
+}
+
+void BackgroundMap::erase(std::string_view key) {
+  auto& shard = shards[shard_index(key)];
+  std::unique_lock l(shard.mtx);
+  if (auto it = shard.map.find(key); it != shard.map.end()) {
+    shard.map.erase(it);
+    shard.count.store(shard.map.size(), std::memory_order_relaxed);
+    entries.fetch_sub(1, std::memory_order_relaxed);
+  }
+}
+
+bool BackgroundMap::increment(std::string_view key, const BackgroundMapValue& by) {
+  auto& shard = shards[shard_index(key)];
+  std::shared_lock l(shard.mtx);
+  const auto it = shard.map.find(key);
+  if (it == shard.map.end()) {
+    return true;
+  }
+  tbb::spin_mutex::scoped_lock entry_lock(it->second.mtx);
+  auto& value = it->second.value;
+  if (auto v = std::get_if<long long int>(&value)) {
+    if (auto b = std::get_if<long long int>(&by)) {
+      *v += *b;
+    } else {
+      value = static_cast<double>(*v) + std::get<double>(by);
+    }
+    return true;
+  }
+  if (auto v = std::get_if<double>(&value)) {
+    std::visit([v](auto b) { if constexpr (std::is_arithmetic_v<decltype(b)>) *v += b; }, by);
+    return true;
+  }
+  return false;
+}
+
+std::optional<std::pair<std::string, BackgroundMapValue>> BackgroundMap::next(
+    std::optional<std::string_view> previous) const {
+  auto entry_at = [](const auto& it) {
+    tbb::spin_mutex::scoped_lock entry_lock(it->second.mtx);
+    return std::make_optional(std::make_pair(it->first, it->second.value));
+  };
+  size_t i = 0;
+  if (previous) {
+    i = shard_index(*previous);
+    const auto& shard = shards[i];
+    std::shared_lock l(shard.mtx);
+    if (auto it = shard.map.upper_bound(*previous); it != shard.map.end()) {
+      return entry_at(it);
+    }
+    ++i;
+  }
+  for (; i < SHARDS; ++i) {
+    const auto& shard = shards[i];
+    if (shard.count.load(std::memory_order_relaxed) == 0) {
+      continue;
+    }
+    std::shared_lock l(shard.mtx);
+    if (auto it = shard.map.begin(); it != shard.map.end()) {
+      return entry_at(it);
+    }
+  }
+  return std::nullopt;
+}
 
 int RGWTable::PairsClosure(lua_State *L) {
   std::ignore = table_name_upvalue(L);
-  auto map = reinterpret_cast<BackgroundMap*>(lua_touserdata(L, lua_upvalueindex(SECOND_UPVAL)));
-  auto mtx = reinterpret_cast<RWLock*>(lua_touserdata(L, lua_upvalueindex(THIRD_UPVAL)));
-  if(luaL_newmetatable(L, "RGW.Iterator")) {
-    lua_pushcfunction(L, [](lua_State* L) {
-      static_cast<RGWTableIterator*>(lua_touserdata(L, 1))->~RGWTableIterator();
-      return 0;
-    });
-    lua_setfield(L, -2, "__gc");
-  }
-  auto iterator = new (lua_newuserdata(L, sizeof(RGWTableIterator))) RGWTableIterator{};
-  lua_insert(L, -2);
-  lua_setmetatable(L, -2);
-
-  {
-    std::unique_lock l(*mtx);
-    if (auto it = map->begin(); it != map->end()) {
-      iterator->next_key = it->first;
-    }
-  }
-
-  lua_pushlightuserdata(L, map);
-  lua_pushlightuserdata(L, mtx);
-  lua_pushcclosure(L, iterator_next, TWO_UPVALS);
-  lua_insert(L, -2);
+  lua_pushlightuserdata(L, lua_touserdata(L, lua_upvalueindex(SECOND_UPVAL)));
+  lua_pushcclosure(L, iterator_next, ONE_UPVAL);
+  lua_pushnil(L);
   lua_pushnil(L);
   return THREE_RETURNVALS;
 }
 
 int RGWTable::iterator_next(lua_State* L) {
   auto map = reinterpret_cast<BackgroundMap*>(lua_touserdata(L, lua_upvalueindex(FIRST_UPVAL)));
-  auto& mtx = *reinterpret_cast<RWLock*>(lua_touserdata(L, lua_upvalueindex(SECOND_UPVAL)));
-  auto iterator = static_cast<RGWTableIterator*>(luaL_checkudata(L, 1, "RGW.Iterator"));
-
-  if (!iterator->next_key) {
+  std::optional<std::string_view> previous;
+  if (!lua_isnoneornil(L, 2)) {
+    size_t len;
+    const char* key = luaL_checklstring(L, 2, &len);
+    previous.emplace(key, len);
+  }
+  const auto entry = map->next(previous);
+  if (!entry) {
     lua_pushnil(L);
     return ONE_RETURNVAL;
   }
-
-  BackgroundMapValue value;
-  {
-    std::unique_lock l(mtx);
-    auto [it, last] = map->equal_range(*iterator->next_key);
-    if (it == last) {
-      iterator->next_key.reset();
-      lua_pushnil(L);
-      lua_pushnil(L);
-      return TWO_RETURNVALS;
-    }
-    iterator->current_key = std::move(*iterator->next_key);
-    value = it->second;
-    if (++it != map->end()) {
-      iterator->next_key = it->first;
-    } else {
-      iterator->next_key.reset();
-    }
-  }
-  pushstring(L, iterator->current_key);
-  std::visit([L](auto&& v) { pushvalue(L, v); }, value);
+  pushstring(L, entry->first);
+  std::visit([L](auto&& v) { pushvalue(L, v); }, entry->second);
   return TWO_RETURNVALS;
 }
 
@@ -83,17 +144,15 @@ const char* RGWTable::INCREMENT = "increment";
 const char* RGWTable::DECREMENT = "decrement";
 
 int RGWTable::increment_by(lua_State* L) {
-  const auto map = reinterpret_cast<BackgroundMap*>(lua_touserdata(L, lua_upvalueindex(FIRST_UPVAL)));
-  auto& mtx = *reinterpret_cast<RWLock*>(lua_touserdata(L, lua_upvalueindex(SECOND_UPVAL)));
-  auto decrement = lua_toboolean(L, lua_upvalueindex(THIRD_UPVAL));
-
-  const auto args = lua_gettop(L);
-  const auto index = luaL_checkstring(L, 1);
+  auto map = reinterpret_cast<BackgroundMap*>(lua_touserdata(L, lua_upvalueindex(FIRST_UPVAL)));
+  const auto decrement = lua_toboolean(L, lua_upvalueindex(SECOND_UPVAL));
+  size_t len;
+  const char* index = luaL_checklstring(L, 1, &len);
 
   // by default we increment by 1/-1
   const long long int default_inc = (decrement ? -1 : 1);
   BackgroundMapValue inc_by = default_inc;
-  if (args == 2) {
+  if (lua_gettop(L) == 2) {
     if (lua_isinteger(L, 2)) {
       inc_by = lua_tointeger(L, 2)*default_inc;
     } else if (lua_isnumber(L, 2)){
@@ -102,27 +161,10 @@ int RGWTable::increment_by(lua_State* L) {
       return luaL_error(L, "can increment only by numeric values");
     }
   }
-
-  std::shared_lock l(mtx);
-  BackgroundMap::accessor accessor;
-  if (map->find(accessor, std::string(index))) {
-    auto& value = accessor->second;
-    if (std::holds_alternative<double>(value) && std::holds_alternative<double>(inc_by)) {
-      value = std::get<double>(value) + std::get<double>(inc_by);
-    } else if (std::holds_alternative<long long int>(value) && std::holds_alternative<long long int>(inc_by)) {
-      value = std::get<long long int>(value) + std::get<long long int>(inc_by);
-    } else if (std::holds_alternative<double>(value) && std::holds_alternative<long long int>(inc_by)) {
-      value = std::get<double>(value) + static_cast<double>(std::get<long long int>(inc_by));
-    } else if (std::holds_alternative<long long int>(value) && std::holds_alternative<double>(inc_by)) {
-      value = static_cast<double>(std::get<long long int>(value)) + std::get<double>(inc_by);
-    } else {
-      accessor.release();
-      l.unlock();
-      return luaL_error(L, "can increment only numeric values");
-    }
+  if (!map->increment({index, len}, inc_by)) {
+    return luaL_error(L, "can increment only numeric values");
   }
-
-  return 0;
+  return NO_RETURNVAL;
 }
 
 static int bytecode_writer (lua_State *L, const void* p, size_t sz, void* ud) {
@@ -211,12 +253,7 @@ std::unique_ptr<lua_state_guard> Background::initialize_lguard_state() {
 const BackgroundMapValue Background::empty_table_value;
 
 BackgroundMapValue Background::get_table_value(const std::string& key) const {
-  std::shared_lock l(table_mutex);
-  BackgroundMap::const_accessor accessor;
-  if (rgw_map.find(accessor, key)) {
-      return accessor->second;
-  }
-  return empty_table_value;
+  return rgw_map.get(key).value_or(empty_table_value);
 }
 
 //(1) Loads the script from the object if not paused
@@ -273,7 +310,7 @@ void Background::run() {
 
 void Background::create_background_metatable(lua_State* L) {
   static const char* background_table_name = "RGW";
-  create_metatable<RGWTable>(L, "", background_table_name, true, &rgw_map, &table_mutex);
+  create_metatable<RGWTable>(L, "", background_table_name, true, &rgw_map);
   lua_getglobal(L, background_table_name);
   ceph_assert(lua_istable(L, -1));
 }

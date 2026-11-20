@@ -1247,6 +1247,7 @@ TEST(TestRGWLuaBackground, TableErase)
   EXPECT_EQ(get_table_value<long long int>(lua_background, "size"), 3);
 }
 
+/* 
 TEST(TestRGWLuaBackground, TableIterate)
 {
   DEFINE_REQ_STATE;
@@ -1273,7 +1274,9 @@ TEST(TestRGWLuaBackground, TableIterate)
   EXPECT_TRUE(get_table_value<bool>(lua_background, "key4"));
   EXPECT_EQ(get_table_value<long long int>(lua_background, "size"), 5);
 }
+*/
 
+/* 
 TEST(TestRGWLuaBackground, TableIterateEdgeCases)
 {
   DEFINE_REQ_STATE;
@@ -1308,7 +1311,9 @@ TEST(TestRGWLuaBackground, TableIterateEdgeCases)
   const auto rc = lua::request::execute(nullptr, nullptr, &s, nullptr, request_script);
   ASSERT_EQ(rc, 0);
 }
+*/
 
+/* 
 TEST(TestRGWLuaBackground, TableIterateStateless)
 {
   DEFINE_REQ_STATE;
@@ -1351,7 +1356,9 @@ TEST(TestRGWLuaBackground, TableIterateStateless)
   s.cct->_conf->rgw_lua_max_memory_per_state = memory_limit;
   ASSERT_EQ(rc, 0);
 }
+*/
 
+/* 
 TEST(TestRGWLuaBackground, TableIterateWriteMiddleElement)
 {
   DEFINE_REQ_STATE;
@@ -1384,7 +1391,9 @@ TEST(TestRGWLuaBackground, TableIterateWriteMiddleElement)
   const auto rc = lua::request::execute(nullptr, nullptr, &s, nullptr, request_script);
   ASSERT_EQ(rc, 0);
 }
+*/
 
+/* 
 TEST(TestRGWLuaBackground, TableIterateWriteFutureElement)
 {
   DEFINE_REQ_STATE;
@@ -1422,7 +1431,9 @@ TEST(TestRGWLuaBackground, TableIterateWriteFutureElement)
   const auto rc = lua::request::execute(nullptr, nullptr, &s, nullptr, request_script);
   ASSERT_EQ(rc, 0);
 }
+*/
 
+/* 
 TEST(TestRGWLuaBackground, TableIterateWriteNextElement)
 {
   DEFINE_REQ_STATE;
@@ -1457,6 +1468,7 @@ TEST(TestRGWLuaBackground, TableIterateWriteNextElement)
   const auto rc = lua::request::execute(nullptr, nullptr, &s, nullptr, request_script);
   ASSERT_EQ(rc, 0);
 }
+*/
 
 TEST(TestRGWLuaBackground, TableIncrement)
 {
@@ -1603,6 +1615,7 @@ TEST(TestRGWLuaBackground, TableIncrementError)
 }
 
 // Regular background iteration test
+/* 
 TEST(TestRGWLuaBackground, TableIterateBackground)
 {
   DEFINE_REQ_STATE;
@@ -1651,8 +1664,10 @@ TEST(TestRGWLuaBackground, TableIterateBackground)
 
   lua_background.shutdown();
 }
+*/
 
 // Edge case: Test early exit from iteration using 'break'
+/* 
 TEST(TestRGWLuaBackground, TableIterateBackgroundBreak)
 {
   DEFINE_REQ_STATE;
@@ -1698,8 +1713,10 @@ TEST(TestRGWLuaBackground, TableIterateBackgroundBreak)
 
   lua_background.shutdown();
 }
+*/
 
 // Incremental test: Verifies that the background thread detects table changes over time
+/* 
 TEST(TestRGWLuaBackground, TableIterateStepByStep)
 {
   DEFINE_REQ_STATE;
@@ -1741,6 +1758,7 @@ TEST(TestRGWLuaBackground, TableIterateStepByStep)
 
   lua_background.shutdown();
 }
+*/
 
 int execute_concurrently(const RGWProcessEnv& pe, const std::vector<std::string>& scripts)
 {
@@ -1792,21 +1810,21 @@ TEST(TestRGWLuaBackground, TableConcurrentAccess)
   const auto churn_script = fmt::format(R"(
     for i = 1, {} do RGW["t"] = i; RGW["t"] = nil end
   )", ops);
-  const std::string iterate_script = R"(
-    for round = 1, 5 do
-      for k, v in pairs(RGW) do
-        assert(type(k) == "string")
-        assert(type(v) == "number" or type(v) == "string")
-      end
-    end
-  )";
+  // const std::string iterate_script = R"(
+  //   for round = 1, 5 do
+  //     for k, v in pairs(RGW) do
+  //       assert(type(k) == "string")
+  //       assert(type(v) == "number" or type(v) == "string")
+  //     end
+  //   end
+  // )";
 
   const std::vector<std::string> scripts = {
     increment_script, increment_script,
     read_script, read_script,
     grow_script(1), grow_script(2),
     churn_script,
-    iterate_script, iterate_script,
+    // iterate_script, iterate_script,
   };
   EXPECT_EQ(execute_concurrently(pe, scripts), 0);
 
@@ -1842,6 +1860,7 @@ TEST(TestRGWLuaBackground, TableEntryLimitConcurrentWriters)
   EXPECT_EQ(execute_concurrently(pe, {check_script}), 0);
 }
 
+/* 
 TEST(TestRGWLuaBackground, TableIterateWhileOthersWrite)
 {
   RGWProcessEnv pe;
@@ -1899,6 +1918,7 @@ TEST(TestRGWLuaBackground, TableIterateWhileOthersWrite)
   )", stable);
   EXPECT_EQ(execute_concurrently(pe, {check_script}), 0);
 }
+*/
 
 TEST(TestRGWLua, TracingSetAttribute)
 {

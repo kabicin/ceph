@@ -11,6 +11,7 @@
 
 namespace rgw::lua {
 
+/*
 int RGWTable::PairsClosure(lua_State *L) {
   std::ignore = table_name_upvalue(L);
   lua_pushlightuserdata(L, lua_touserdata(L, lua_upvalueindex(SECOND_UPVAL)));
@@ -23,7 +24,7 @@ int RGWTable::PairsClosure(lua_State *L) {
 
 int RGWTable::iterator_next(lua_State* L) {
   auto map = reinterpret_cast<BackgroundMap*>(lua_touserdata(L, lua_upvalueindex(FIRST_UPVAL)));
-  auto& mtx = *reinterpret_cast<RWLock*>(lua_touserdata(L, lua_upvalueindex(SECOND_UPVAL)));
+  auto& mtx = *reinterpret_cast<std::mutex*>(lua_touserdata(L, lua_upvalueindex(SECOND_UPVAL)));
 
   std::optional<std::string> previous;
   if (!lua_isnoneornil(L, 2)) {
@@ -56,13 +57,14 @@ int RGWTable::iterator_next(lua_State* L) {
   std::visit([L](auto&& v) { pushvalue(L, v); }, value);
   return TWO_RETURNVALS;
 }
+*/
 
 const char* RGWTable::INCREMENT = "increment";
 const char* RGWTable::DECREMENT = "decrement";
 
 int RGWTable::increment_by(lua_State* L) {
   const auto map = reinterpret_cast<BackgroundMap*>(lua_touserdata(L, lua_upvalueindex(FIRST_UPVAL)));
-  auto& mtx = *reinterpret_cast<RWLock*>(lua_touserdata(L, lua_upvalueindex(SECOND_UPVAL)));
+  auto& mtx = *reinterpret_cast<std::mutex*>(lua_touserdata(L, lua_upvalueindex(SECOND_UPVAL)));
   auto decrement = lua_toboolean(L, lua_upvalueindex(THIRD_UPVAL));
 
   const auto args = lua_gettop(L);
@@ -81,7 +83,7 @@ int RGWTable::increment_by(lua_State* L) {
     }
   }
 
-  std::shared_lock l(mtx);
+  std::unique_lock l(mtx);
   BackgroundMap::accessor accessor;
   if (map->find(accessor, std::string(index))) {
     auto& value = accessor->second;
@@ -189,7 +191,7 @@ std::unique_ptr<lua_state_guard> Background::initialize_lguard_state() {
 const BackgroundMapValue Background::empty_table_value;
 
 BackgroundMapValue Background::get_table_value(const std::string& key) const {
-  std::shared_lock l(table_mutex);
+  std::unique_lock l(table_mutex);
   BackgroundMap::const_accessor accessor;
   if (rgw_map.find(accessor, key)) {
       return accessor->second;

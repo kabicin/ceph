@@ -1274,6 +1274,84 @@ TEST(TestRGWLuaBackground, TableIterate)
   EXPECT_EQ(get_table_value<long long int>(lua_background, "size"), 5);
 }
 
+TEST(TestRGWLuaBackground, TableIterateEdgeCases)
+{
+  DEFINE_REQ_STATE;
+  TestBackground lua_background(pe.lua.manager.get());
+
+  const std::string request_script = R"(
+    for k, v in pairs(RGW) do
+      error("empty table visited " .. k)
+    end
+
+    RGW[""] = 1
+    local n = 0
+    for k, v in pairs(RGW) do
+      assert(k == "" and v == 1)
+      n = n + 1
+    end
+    assert(n == 1, "empty key visited " .. n .. " times")
+    RGW[""] = nil
+
+    for i = 1, 10 do RGW["key" .. i] = i end
+    n = 0
+    for k, v in pairs(RGW) do
+      RGW[k] = nil
+      n = n + 1
+    end
+    assert(n == 10, "visited " .. n .. " of 10")
+    assert(#RGW == 0)
+  )";
+
+  pe.lua.background = &lua_background;
+
+  const auto rc = lua::request::execute(nullptr, nullptr, &s, nullptr, request_script);
+  ASSERT_EQ(rc, 0);
+}
+
+TEST(TestRGWLuaBackground, TableIterateStateless)
+{
+  DEFINE_REQ_STATE;
+  TestBackground lua_background(pe.lua.manager.get());
+
+  const std::string request_script = R"(
+    for i = 1, 100 do RGW["stable" .. i] = i end
+
+    local f, s, c = pairs(RGW)
+    assert(s == nil and c == nil)
+    local first = f(s, c)
+    local second = f(s, first)
+    assert(f(s, c) == first, "calling with the same control did not repeat")
+    assert(f(s, first) == second, "calling with the same control did not repeat")
+
+    local n1 = 0
+    for k in f, s, c do n1 = n1 + 1; if n1 == 10 then break end end
+    local n2 = 0
+    for k in f, s, c do n2 = n2 + 1 end
+    assert(n2 == 100, "second loop visited " .. n2 .. " of 100")
+
+    local seen, i = {}, 0
+    for k, v in pairs(RGW) do
+      if k:sub(1, 6) == "stable" then
+        assert(not seen[k], k .. " visited twice")
+        seen[k] = true
+      end
+      i = i + 1
+      for j = 1, 5 do RGW["new" .. i .. "_" .. j] = j end
+      RGW["new" .. i .. "_1"] = nil
+    end
+    for j = 1, 100 do assert(seen["stable" .. j], "stable" .. j .. " never visited") end
+  )";
+
+  pe.lua.background = &lua_background;
+
+  const auto memory_limit = s.cct->_conf->rgw_lua_max_memory_per_state;
+  s.cct->_conf->rgw_lua_max_memory_per_state = 0;
+  const auto rc = lua::request::execute(nullptr, nullptr, &s, nullptr, request_script);
+  s.cct->_conf->rgw_lua_max_memory_per_state = memory_limit;
+  ASSERT_EQ(rc, 0);
+}
+
 TEST(TestRGWLuaBackground, TableIterateWriteMiddleElement)
 {
   DEFINE_REQ_STATE;
@@ -1323,7 +1401,6 @@ TEST(TestRGWLuaBackground, TableIterateWriteFutureElement)
       table.insert(order, k)
     end
     local total = #order
-    -- erase the key after the next one, so the iteration can still advance
     local erased_key = order[3]
     local counter = 0
     local seen = {}
@@ -1365,13 +1442,13 @@ TEST(TestRGWLuaBackground, TableIterateWriteNextElement)
     local counter = 0
     for k, v in pairs(RGW) do
       counter = counter + 1
+      assert(k ~= erased_key, "erased key '" .. erased_key .. "' was visited")
       if counter == 1 then
         RGW[erased_key] = nil
         print("next element '" .. erased_key .. "' is deleted")
       end
     end
-    -- the iteration loses its position when the next key is erased
-    assert(counter == 1)
+    assert(counter == 4, "visited " .. counter .. " of 4")
     assert(RGW[erased_key] == nil)
   )";
 
@@ -1762,6 +1839,64 @@ TEST(TestRGWLuaBackground, TableEntryLimitConcurrentWriters)
     assert(n <= {} + 1, "table holds " .. n .. " entries")
     assert(n >= {} - {}, "table holds " .. n .. " entries")
   )", lua::MAX_LUA_KEY_ENTRIES, lua::MAX_LUA_KEY_ENTRIES, writers);
+  EXPECT_EQ(execute_concurrently(pe, {check_script}), 0);
+}
+
+TEST(TestRGWLuaBackground, TableIterateWhileOthersWrite)
+{
+  RGWProcessEnv pe;
+  pe.lua.manager = std::make_unique<TestLuaManager>();
+  TestBackground lua_background(pe.lua.manager.get());
+  pe.lua.background = &lua_background;
+
+  constexpr int stable = 300;
+  for (int i = 1; i <= stable; ++i) {
+    lua_background.put_table_value(fmt::format("stable{}", i), static_cast<long long>(i));
+  }
+
+  std::vector<std::string> scripts;
+  for (int r = 0; r < 2; ++r) {
+    scripts.push_back(fmt::format(R"(
+      for loop = 1, 10 do
+        local seen, n = {{}}, 0
+        for k, v in pairs(RGW) do
+          if k:sub(1, 6) == "stable" then
+            if seen[k] then error("loop " .. loop .. ": " .. k .. " visited twice") end
+            if v ~= tonumber(k:sub(7)) then error(k .. " has value " .. tostring(v)) end
+            seen[k] = true
+            n = n + 1
+          end
+        end
+        if n ~= {} then error("loop " .. loop .. ": saw " .. n .. " of {} stable keys") end
+      end
+    )", stable, stable));
+  }
+  for (int w = 0; w < 4; ++w) {
+    scripts.push_back(fmt::format(R"(
+      for i = 1, 4000 do
+        local k = "w{}-" .. i
+        RGW[k] = i
+        if i % 16 ~= 0 then RGW[k] = nil end
+      end
+    )", w));
+  }
+
+  auto& conf = g_ceph_context->_conf;
+  const auto memory_limit = conf->rgw_lua_max_memory_per_state;
+  const auto runtime_limit = conf->rgw_lua_max_runtime_per_state;
+  conf->rgw_lua_max_memory_per_state = 0;
+  conf->rgw_lua_max_runtime_per_state = 0;
+  const auto failures = execute_concurrently(pe, scripts);
+  conf->rgw_lua_max_memory_per_state = memory_limit;
+  conf->rgw_lua_max_runtime_per_state = runtime_limit;
+  EXPECT_EQ(failures, 0);
+
+  const auto check_script = fmt::format(R"(
+    local n = 0
+    for k in pairs(RGW) do n = n + 1 end
+    assert(n == #RGW, "pairs saw " .. n .. ", #RGW is " .. #RGW)
+    assert(n == {} + 4 * 250, "table holds " .. n)
+  )", stable);
   EXPECT_EQ(execute_concurrently(pe, {check_script}), 0);
 }
 

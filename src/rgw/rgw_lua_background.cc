@@ -11,37 +11,12 @@
 
 namespace rgw::lua {
 
-struct RGWTableIterator {
-  std::string current_key;
-  std::optional<std::string> next_key;
-};
-
 int RGWTable::PairsClosure(lua_State *L) {
   std::ignore = table_name_upvalue(L);
-  auto map = reinterpret_cast<BackgroundMap*>(lua_touserdata(L, lua_upvalueindex(SECOND_UPVAL)));
-  auto mtx = reinterpret_cast<RWLock*>(lua_touserdata(L, lua_upvalueindex(THIRD_UPVAL)));
-  if(luaL_newmetatable(L, "RGW.Iterator")) {
-    lua_pushcfunction(L, [](lua_State* L) {
-      static_cast<RGWTableIterator*>(lua_touserdata(L, 1))->~RGWTableIterator();
-      return 0;
-    });
-    lua_setfield(L, -2, "__gc");
-  }
-  auto iterator = new (lua_newuserdata(L, sizeof(RGWTableIterator))) RGWTableIterator{};
-  lua_insert(L, -2);
-  lua_setmetatable(L, -2);
-
-  {
-    std::unique_lock l(*mtx);
-    if (auto it = map->begin(); it != map->end()) {
-      iterator->next_key = it->first;
-    }
-  }
-
-  lua_pushlightuserdata(L, map);
-  lua_pushlightuserdata(L, mtx);
+  lua_pushlightuserdata(L, lua_touserdata(L, lua_upvalueindex(SECOND_UPVAL)));
+  lua_pushlightuserdata(L, lua_touserdata(L, lua_upvalueindex(THIRD_UPVAL)));
   lua_pushcclosure(L, iterator_next, TWO_UPVALS);
-  lua_insert(L, -2);
+  lua_pushnil(L);
   lua_pushnil(L);
   return THREE_RETURNVALS;
 }
@@ -49,32 +24,35 @@ int RGWTable::PairsClosure(lua_State *L) {
 int RGWTable::iterator_next(lua_State* L) {
   auto map = reinterpret_cast<BackgroundMap*>(lua_touserdata(L, lua_upvalueindex(FIRST_UPVAL)));
   auto& mtx = *reinterpret_cast<RWLock*>(lua_touserdata(L, lua_upvalueindex(SECOND_UPVAL)));
-  auto iterator = static_cast<RGWTableIterator*>(luaL_checkudata(L, 1, "RGW.Iterator"));
 
-  if (!iterator->next_key) {
-    lua_pushnil(L);
-    return ONE_RETURNVAL;
+  std::optional<std::string> previous;
+  if (!lua_isnoneornil(L, 2)) {
+    size_t len;
+    const char* key = luaL_checklstring(L, 2, &len);
+    previous.emplace(key, len);
   }
 
+  std::string key;
   BackgroundMapValue value;
   {
     std::unique_lock l(mtx);
-    auto [it, last] = map->equal_range(*iterator->next_key);
-    if (it == last) {
-      iterator->next_key.reset();
-      lua_pushnil(L);
-      lua_pushnil(L);
-      return TWO_RETURNVALS;
+    const BackgroundMap::value_type* next = nullptr;
+    for (const auto& entry : *map) {
+      if (previous && entry.first <= *previous) {
+        continue;
+      }
+      if (!next || entry.first < next->first) {
+        next = &entry;
+      }
     }
-    iterator->current_key = std::move(*iterator->next_key);
-    value = it->second;
-    if (++it != map->end()) {
-      iterator->next_key = it->first;
-    } else {
-      iterator->next_key.reset();
+    if (!next) {
+      lua_pushnil(L);
+      return ONE_RETURNVAL;
     }
+    key = next->first;
+    value = next->second;
   }
-  pushstring(L, iterator->current_key);
+  pushstring(L, key);
   std::visit([L](auto&& v) { pushvalue(L, v); }, value);
   return TWO_RETURNVALS;
 }
